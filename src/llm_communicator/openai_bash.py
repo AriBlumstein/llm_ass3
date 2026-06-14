@@ -55,7 +55,7 @@ class BashCommandInput(BaseModel):
         description="A short explanation of what this bash command will perform on the host system."
     )
 
-def execute_bash(command: str) -> str:
+def execute_bash(command: str, verbose: bool = True) -> str:
     """
     Executes a raw bash string in an isolated subprocess under strict constraints.
     Returns stdout/stderr merged result as a single string.
@@ -67,7 +67,8 @@ def execute_bash(command: str) -> str:
                 f"Security Block: Command contains banned structural pattern matching '{pattern}'."
             )
 
-    print(f"\n[EXEC] Running Command:\n{command}\n")
+    if verbose:
+        print(f"\n[EXEC] Running Command:\n{command}\n")
 
     try:
         # We explicitly invoke bash as the shell shell binary rather than relying on default sh
@@ -77,6 +78,14 @@ def execute_bash(command: str) -> str:
             text=True,
             timeout=15.0  # Safe execution timeout boundary to prevent infinite processes
         )
+
+        if not verbose:
+            output = ""
+            if result.stdout:
+                output += result.stdout
+            if result.stderr:
+                output += result.stderr
+            return output
 
         output = ""
         if result.stdout:
@@ -197,8 +206,48 @@ class BashToolAgent:
 
         return "Agent execution terminated: reached maximum reasoning iterations boundary limit."
 
+    def run_single(self, instruction: str) -> None:
+        """
+        Coordinates a single user query execution. Translates instruction to a shell command,
+        prints it, executes it, and prints the output.
+        """
+        self.conversation_history.append({"role": "user", "content": instruction})
+
+        # Call the LLM with our available tool schemas
+        response = self.client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=self.conversation_history,
+            tools=tools_definition,
+            tool_choice="auto"
+        )
+
+        assistant_message: ChatCompletionMessage = response.choices[0].message
+        self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
+
+        if assistant_message.tool_calls:
+            for tool_call in assistant_message.tool_calls:
+                if tool_call.function.name == "execute_bash_command":
+                    # Extract and parse model generated arguments
+                    args_data = json.loads(tool_call.function.arguments)
+                    command_input = BashCommandInput(**args_data)
+
+                    # Print the command
+                    print(command_input.command)
+
+                    # Execute command
+                    execution_result = execute_bash(command_input.command, verbose=False)
+
+                    # Print the execution result to the screen
+                    if execution_result:
+                        print(execution_result, end="")
+        elif assistant_message.content:
+            print(assistant_message.content)
+        else:
+            print("Error Unknown")
+
 
 if __name__ == "__main__":
     pass
+
 
     
