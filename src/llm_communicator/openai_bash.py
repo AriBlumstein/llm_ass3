@@ -92,9 +92,8 @@ def execute_bash(command: str, verbose: bool = True) -> str:
             output += f"--- STDOUT ---\n{result.stdout}\n"
         if result.stderr:
             output += f"--- STDERR ---\n{result.stderr}\n"
-        if result.returncode:
+        if result.returncode is not None:
             output += f"--- RETURN CODE ---\n{result.returncode}\n"
-            
 
         if not output:
             output = "[Success: Command executed with no returning output channels]"
@@ -227,19 +226,31 @@ class BashToolAgent:
         if assistant_message.tool_calls:
             for tool_call in assistant_message.tool_calls:
                 if tool_call.function.name == "execute_bash_command":
-                    # Extract and parse model generated arguments
-                    args_data = json.loads(tool_call.function.arguments)
-                    command_input = BashCommandInput(**args_data)
+                    try:
+                        # Extract and parse model generated arguments
+                        args_data = json.loads(tool_call.function.arguments)
+                        command_input = BashCommandInput(**args_data)
 
-                    # Print the command
-                    print(command_input.command)
+                        print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
 
-                    # Execute command
-                    execution_result = execute_bash(command_input.command, verbose=False)
+                        # Execute command
+                        execution_result = execute_bash(command_input.command)
+                    except json.JSONDecodeError:
+                        execution_result = "[Error: Generated JSON arguments failed structure validation rules]"
+                    except BashSafetyViolationError as safety_err:
+                        execution_result = f"[Error: {str(safety_err)}]"
+                    except Exception as e:
+                        execution_result = f"[Error: Failed to process tool call arguments: {str(e)}]"
 
-                    # Print the execution result to the screen
-                    if execution_result:
-                        print(execution_result, end="")
+                    print(f"[RESULT] Shell Response:\n{execution_result}")
+
+                    # Feedback execution output directly back into LLM context window
+                    self.conversation_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "content": execution_result
+                    })
         elif assistant_message.content:
             print(assistant_message.content)
         else:
