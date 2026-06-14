@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# 1. Get the absolute path of the directory where THIS script lives (the src folder)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 2. Get the project root (one level up from src)
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# 3. Dynamically set PYTHONPATH using the resolved folder
+export PYTHONPATH="$SCRIPT_DIR"
+
+# 4. Run uv pointing to the resolved project directory
+uv run --project "$PROJECT_ROOT" -m doit_module "$@"
