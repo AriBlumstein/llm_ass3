@@ -1,4 +1,12 @@
 import os
+import sys
+from pathlib import Path
+
+# Add the parent 'src' directory to sys.path to allow sibling module imports
+src_dir = str(Path(__file__).resolve().parent.parent)
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
 from fixtures import OPENAI_API_KEY, MODEL_NAME
 from openai import OpenAI
 
