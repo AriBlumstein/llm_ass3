@@ -428,7 +428,6 @@ class BashToolAgent:
                         break
                     continue
 
-                print(f"[TEXT RESPONSE] Raw output: {content}")
                 print(f"[TEXT PARSED] Command: {command}")
                 print(f"[TEXT PARSED] Explanation: {explanation}")
                 
@@ -566,7 +565,7 @@ class BashToolAgent:
                     print(content)
                 return
 
-            print(f"[TEXT RESPONSE] Raw output: {content}")
+            
             print(f"[TEXT PARSED] Command: {command}")
             print(f"[TEXT PARSED] Explanation: {explanation}")
             

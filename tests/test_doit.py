@@ -326,3 +326,13 @@ def test_run_single_tool_calling_reason_fallback_in_content(mock_print, mock_com
     mock_print.assert_any_call("Pigs do not fly")
 
 
+def test_system_prompt_contains_anti_echo_warning():
+    """Verify that DOIT_SYSTEM_PROMPT contains specific instructions forbidding echo/printf workarounds."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    assert "echo" in DOIT_SYSTEM_PROMPT.lower()
+    assert "printf" in DOIT_SYSTEM_PROMPT.lower()
+    assert "irrelevant" in DOIT_SYSTEM_PROMPT.lower()
+    assert "native tool calling" in DOIT_SYSTEM_PROMPT.lower()
+
+
+
