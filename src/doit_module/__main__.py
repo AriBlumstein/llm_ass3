@@ -3,7 +3,7 @@
 import argparse
 import subprocess
 import sys
-from llm_communicator.openai_bash import BashToolAgent, BashSafetyViolationError
+from llm_communicator.llm_bash import BashToolAgent, BashSafetyViolationError
 
 
 def main():
