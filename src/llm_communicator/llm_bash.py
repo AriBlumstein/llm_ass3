@@ -248,7 +248,9 @@ tools_definition: List[Dict[str, Any]] = [
             "name": "execute_bash_command",
             "description": (
                 "Executes a localized bash command on the host terminal environment. "
-                "Use this tool to execute the user's requested command if it is possible."
+                "Use this tool ONLY to execute the user's requested bash command. "
+                "DO NOT call this tool for general knowledge, questions, or irrelevant inputs "
+                "(e.g., do not generate 'echo' commands to answer questions)."
             ),
             "parameters": BashCommandInput.model_json_schema()
         }
@@ -362,6 +364,7 @@ class BashToolAgent:
                             args_data = json.loads(tool_call.function.arguments)
                             command_input = BashCommandInput(**args_data)
                             
+                            print(f"[TOOL REQUESTED] Command: {command_input.command}")
                             print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
                             
                             modifies, filter_explanation = self._filter_bash(command_input.command)
@@ -403,6 +406,8 @@ class BashToolAgent:
                     command = parsed.get("command", "")
                     explanation = parsed.get("explanation", "")
                     response_text = parsed.get("response_text", "")
+                    if not response_text:
+                        response_text = parsed.get("reason", "") or explanation
                     rule_triggered = parsed.get("rule_triggered")
                     
                     # Backward compatible executable check
@@ -451,11 +456,24 @@ class BashToolAgent:
                 })
 
             elif assistant_message.content:
-                print(assistant_message.content)
-                if assistant_message.content == "Exiting...":
+                content = assistant_message.content.strip()
+                if content == "Exiting...":
                     break
-                else:
-                    self.conversation_history.append({"role": "assistant", "content": assistant_message.content})
+                try:
+                    parsed = parse_json_response(content)
+                    response_text = parsed.get("response_text", "")
+                    if not response_text:
+                        response_text = parsed.get("reason", "") or parsed.get("explanation", "")
+                    if response_text:
+                        print(response_text)
+                    else:
+                        print(content)
+                except Exception:
+                    print(assistant_message.content)
+                    if assistant_message.content == "Exiting...":
+                        break
+                    else:
+                        self.conversation_history.append({"role": "assistant", "content": assistant_message.content})
             else:
                 print("Error Unknown")
 
@@ -489,6 +507,7 @@ class BashToolAgent:
                         args_data = json.loads(tool_call.function.arguments)
                         command_input = BashCommandInput(**args_data)
 
+                        print(f"[TOOL REQUESTED] Command: {command_input.command}")
                         print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
 
                         modifies, filter_explanation = self._filter_bash(command_input.command)
@@ -529,6 +548,8 @@ class BashToolAgent:
                 command = parsed.get("command", "")
                 explanation = parsed.get("explanation", "")
                 response_text = parsed.get("response_text", "")
+                if not response_text:
+                    response_text = parsed.get("reason", "") or explanation
                 rule_triggered = parsed.get("rule_triggered")
                 
                 # Backward compatible executable check
@@ -572,6 +593,17 @@ class BashToolAgent:
             })
             
         elif assistant_message.content:
-            print(assistant_message.content)
+            content = assistant_message.content.strip()
+            try:
+                parsed = parse_json_response(content)
+                response_text = parsed.get("response_text", "")
+                if not response_text:
+                    response_text = parsed.get("reason", "") or parsed.get("explanation", "")
+                if response_text:
+                    print(response_text)
+                else:
+                    print(content)
+            except Exception:
+                print(assistant_message.content)
         else:
             print("Error Unknown")

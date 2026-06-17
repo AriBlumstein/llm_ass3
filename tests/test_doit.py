@@ -282,3 +282,47 @@ def test_run_single_non_tool_calling_declined(mock_input, mock_execute_bash, moc
     mock_input.assert_called_once()
     mock_execute_bash.assert_not_called()
     assert agent.conversation_history[-1]["content"] == "Command execution output:\n[Cancelled: User declined to execute command that modifies the file system]"
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("builtins.print")
+def test_run_single_non_tool_calling_reason_fallback(mock_print, mock_completion, mock_load_config):
+    # Configure agent to be non-tool-calling
+    mock_load_config.return_value = ("ollama/qwen3:4b-instruct", None, False)
+    
+    # Mock text output containing JSON with 'reason' instead of 'response_text'
+    msg_gen = MockMessage(content='{"executable": false, "reason": "General knowledge question"}')
+    
+    mock_completion.side_effect = [
+        MockResponse(msg_gen)
+    ]
+    
+    agent = BashToolAgent()
+    agent.run_single("can pigs fly")
+    
+    # Check that the reason was printed
+    mock_print.assert_any_call("General knowledge question")
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("builtins.print")
+def test_run_single_tool_calling_reason_fallback_in_content(mock_print, mock_completion, mock_load_config):
+    # Configure agent to be tool-calling
+    mock_load_config.return_value = ("ollama/qwen3:4b-instruct", None, True)
+    
+    # Mock text output containing JSON in assistant_message.content (no tool calls)
+    msg_gen = MockMessage(content='{"executable": false, "reason": "Pigs do not fly"}')
+    
+    mock_completion.side_effect = [
+        MockResponse(msg_gen)
+    ]
+    
+    agent = BashToolAgent()
+    agent.run_single("can pigs fly")
+    
+    # Check that the reason was printed
+    mock_print.assert_any_call("Pigs do not fly")
+
+
