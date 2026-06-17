@@ -16,7 +16,9 @@ from llm_communicator.llm_bash import (
     BashSafetyViolationError,
     execute_bash,
     parse_json_response,
+    _is_bare_echo,
 )
+from fixtures import PURPOSE_MESSAGE
 
 # Helpers to mock Chat Completion responses
 class MockFunction:
@@ -321,8 +323,104 @@ def test_run_single_tool_calling_reason_fallback_in_content(mock_print, mock_com
     
     agent = BashToolAgent()
     agent.run_single("can pigs fly")
-    
+
     # Check that the reason was printed
     mock_print.assert_any_call("Pigs do not fly")
+
+
+# =====================================================================
+# SECTION 7: Intent Gate - refuse to answer questions, only run commands
+# =====================================================================
+
+@pytest.mark.parametrize("command,expected", [
+    ('echo "Pigs cannot fly."', True),     # answering a question with echo
+    ("echo hello", True),
+    ("  printf 'hi'  ", True),
+    ('echo "x" > file.txt', False),         # redirect = real file write
+    ("echo $(date)", False),                # command substitution = real work
+    ("echo hi | wc -c", False),             # pipe = real work
+    ("echo a && rm b", False),              # chaining
+    ("ls -la", False),                      # not an echo at all
+    ("", False),
+])
+def test_is_bare_echo(command, expected):
+    assert _is_bare_echo(command) is expected
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_classify_intent_question(mock_completion):
+    mock_completion.return_value = MockResponse(
+        MockMessage(content="DECISION: QUESTION\nEXPLANATION: general trivia")
+    )
+    agent = BashToolAgent(api_key="fake-key")
+    assert agent._classify_intent("what is the capital of france") == "QUESTION"
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_classify_intent_task(mock_completion):
+    mock_completion.return_value = MockResponse(MockMessage(content="DECISION: TASK"))
+    agent = BashToolAgent(api_key="fake-key")
+    assert agent._classify_intent("list all files") == "TASK"
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_classify_intent_fails_open_to_task(mock_completion):
+    # If the classifier errors, never wrongly block a real command.
+    mock_completion.side_effect = RuntimeError("model offline")
+    agent = BashToolAgent(api_key="fake-key")
+    assert agent._classify_intent("anything") == "TASK"
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+@patch("builtins.print")
+def test_run_single_blocks_question_answered_with_echo(mock_print, mock_execute_bash, mock_completion):
+    """A question must NOT be answered via echo - the agent states its purpose instead."""
+    tool_call = MockToolCall(
+        "call_1", "execute_bash_command",
+        {"command": 'echo "Pigs cannot fly."', "explanation": "answer the question"}
+    )
+    msg_gen = MockMessage(tool_calls=[tool_call])
+    msg_intent = MockMessage(content="DECISION: QUESTION\nEXPLANATION: general knowledge")
+
+    # gen -> intent (QUESTION) ; no filter / no execution
+    mock_completion.side_effect = [MockResponse(msg_gen), MockResponse(msg_intent)]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("can pigs fly?")
+
+    mock_execute_bash.assert_not_called()
+    mock_print.assert_any_call(PURPOSE_MESSAGE)
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+@patch("builtins.print")
+def test_run_single_allows_legit_echo_task(mock_print, mock_execute_bash, mock_completion):
+    """A genuine 'print X' request that uses echo is classified TASK and runs."""
+    tool_call = MockToolCall(
+        "call_1", "execute_bash_command",
+        {"command": 'echo "hello world"', "explanation": "print text"}
+    )
+    msg_gen = MockMessage(tool_calls=[tool_call])
+    msg_intent = MockMessage(content="DECISION: TASK\nEXPLANATION: prints text")
+    msg_filter = MockMessage(content="DECISION: NO\nEXPLANATION: read only")
+
+    # gen -> intent (TASK) -> filter (NO) -> execute
+    mock_completion.side_effect = [
+        MockResponse(msg_gen),
+        MockResponse(msg_intent),
+        MockResponse(msg_filter),
+    ]
+    mock_execute_bash.return_value = "hello world"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input") as mock_input:
+        agent.run_single('print "hello world" to the screen')
+        mock_input.assert_not_called()
+
+    mock_execute_bash.assert_called_once_with('echo "hello world"')
 
 

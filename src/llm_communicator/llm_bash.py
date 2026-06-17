@@ -6,7 +6,14 @@ src_dir = str(Path(__file__).resolve().parent.parent)
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT
+from fixtures import (
+    OPENAI_API_KEY,
+    MODEL_NAME,
+    DOIT_SYSTEM_PROMPT,
+    DOIT_FILTER_PROMPT,
+    DOIT_INTENT_PROMPT,
+    PURPOSE_MESSAGE,
+)
 from doit_module.config_loader import load_config
 
 import os
@@ -140,6 +147,20 @@ def parse_json_response(content: str) -> Dict[str, Any]:
             pass
             
     return json.loads(content)
+
+
+# A command that is just `echo`/`printf` of static text - no pipes, redirects,
+# command substitution, sub-shells, or chaining. A weak model produces this to
+# "answer" a question (e.g. echo "Pigs cannot fly.") instead of doing real work.
+_BARE_ECHO_RE = re.compile(r"^\s*(?:echo|printf)\b[^|&;<>`$()\n]*$")
+
+
+def _is_bare_echo(command: str) -> bool:
+    """Return True when the command merely prints static text and performs no
+    real terminal operation - the classic 'answer a question with echo' pattern."""
+    if not command:
+        return False
+    return bool(_BARE_ECHO_RE.match(command.strip()))
 
 
 @functools.lru_cache(maxsize=1)
@@ -330,13 +351,61 @@ class BashToolAgent:
 
         return True, explanation
 
+    def _classify_intent(self, user_input: str) -> str:
+        """Classify the user's input as 'TASK', 'QUESTION', or 'EXIT'.
+
+        This stops a weak model from "answering" a question with an echo command:
+        the tool generates and runs shell code, it does not answer general
+        questions. Fails open to 'TASK' so genuine commands are never wrongly
+        blocked.
+        """
+        try:
+            response = litellm.completion(
+                model=self.model_name,
+                api_base=self.api_base,
+                messages=[
+                    {"role": "system", "content": DOIT_INTENT_PROMPT},
+                    {"role": "user", "content": user_input},
+                ],
+            )
+            content = (response.choices[0].message.content or "").strip()
+        except Exception:
+            return "TASK"
+
+        match = re.search(r"\bDECISION:\s*(TASK|QUESTION|EXIT)\b", content, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+
+        # Loose fallback if the model skipped the DECISION header.
+        upper = content.upper()
+        if "EXIT" in upper:
+            return "EXIT"
+        if "QUESTION" in upper:
+            return "QUESTION"
+        return "TASK"
+
+    def _maybe_block_question(self, user_input: str, command: str = "") -> Optional[str]:
+        """Return the polite purpose message if the user input is a general
+        question / chit-chat rather than a real terminal task; otherwise None.
+
+        To avoid adding latency to normal commands, the classifier only runs in
+        the suspicious cases: a bare echo/printf (the "answer with echo"
+        anti-pattern) or when the model produced no command at all.
+        """
+        if command and not _is_bare_echo(command):
+            return None
+        if self._classify_intent(user_input) == "QUESTION":
+            return PURPOSE_MESSAGE
+        return None
+
     def run_agent_loop(self, max_iterations: int = 5) -> str:
         """
         Coordinates the agent run cycle. Iterates until standard completions are hit.
         """
         for step in range(max_iterations):
-            self.conversation_history.append({"role": "user", "content": input("Describe your command: ")})
-            
+            user_input = input("Describe your command: ")
+            self.conversation_history.append({"role": "user", "content": user_input})
+
             print(f"\n--- [AGENT ITERATION STEP {step + 1}/{max_iterations}] ---")
 
             completion_params = {
@@ -366,18 +435,23 @@ class BashToolAgent:
                             
                             print(f"[TOOL REQUESTED] Command: {command_input.command}")
                             print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
-                            
-                            modifies, filter_explanation = self._filter_bash(command_input.command)
-                            should_execute = True
-                            if modifies:
-                                print(f"This command will modify your file system: {filter_explanation}")
-                                user_choice = input("Do you want to continue? [y/n]: ").strip().lower()
-                                if user_choice not in ('y', 'yes'):
-                                    should_execute = False
-                                    execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
 
-                            if should_execute:
-                                execution_result = execute_bash(command_input.command)
+                            block_msg = self._maybe_block_question(user_input, command_input.command)
+                            if block_msg:
+                                print(block_msg)
+                                execution_result = block_msg
+                            else:
+                                modifies, filter_explanation = self._filter_bash(command_input.command)
+                                should_execute = True
+                                if modifies:
+                                    print(f"This command will modify your file system: {filter_explanation}")
+                                    user_choice = input("Do you want to continue? [y/n]: ").strip().lower()
+                                    if user_choice not in ('y', 'yes'):
+                                        should_execute = False
+                                        execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
+
+                                if should_execute:
+                                    execution_result = execute_bash(command_input.command)
                         except json.JSONDecodeError:
                             execution_result = "[Error: Generated JSON arguments failed structure validation rules]"
                         except BashSafetyViolationError as safety_err:
@@ -428,10 +502,15 @@ class BashToolAgent:
                         break
                     continue
 
+                block_msg = self._maybe_block_question(user_input, command)
+                if block_msg:
+                    print(block_msg)
+                    continue
+
                 print(f"[TEXT RESPONSE] Raw output: {content}")
                 print(f"[TEXT PARSED] Command: {command}")
                 print(f"[TEXT PARSED] Explanation: {explanation}")
-                
+
                 try:
                     modifies, filter_explanation = self._filter_bash(command)
                     should_execute = True
@@ -459,6 +538,12 @@ class BashToolAgent:
                 content = assistant_message.content.strip()
                 if content == "Exiting...":
                     break
+
+                block_msg = self._maybe_block_question(user_input, "")
+                if block_msg:
+                    print(block_msg)
+                    continue
+
                 try:
                     parsed = parse_json_response(content)
                     response_text = parsed.get("response_text", "")
@@ -510,17 +595,22 @@ class BashToolAgent:
                         print(f"[TOOL REQUESTED] Command: {command_input.command}")
                         print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
 
-                        modifies, filter_explanation = self._filter_bash(command_input.command)
-                        should_execute = True
-                        if modifies:
-                            print(f"This command will modify your file system: {filter_explanation}")
-                            user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
-                            if user_choice not in ('y', 'yes'):
-                                should_execute = False
-                                execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
+                        block_msg = self._maybe_block_question(instruction, command_input.command)
+                        if block_msg:
+                            print(block_msg)
+                            execution_result = block_msg
+                        else:
+                            modifies, filter_explanation = self._filter_bash(command_input.command)
+                            should_execute = True
+                            if modifies:
+                                print(f"This command will modify your file system: {filter_explanation}")
+                                user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
+                                if user_choice not in ('y', 'yes'):
+                                    should_execute = False
+                                    execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
 
-                        if should_execute:
-                            execution_result = execute_bash(command_input.command)
+                            if should_execute:
+                                execution_result = execute_bash(command_input.command)
                     except json.JSONDecodeError:
                         execution_result = "[Error: Generated JSON arguments failed structure validation rules]"
                     except BashSafetyViolationError as safety_err:
@@ -566,10 +656,15 @@ class BashToolAgent:
                     print(content)
                 return
 
+            block_msg = self._maybe_block_question(instruction, command)
+            if block_msg:
+                print(block_msg)
+                return
+
             print(f"[TEXT RESPONSE] Raw output: {content}")
             print(f"[TEXT PARSED] Command: {command}")
             print(f"[TEXT PARSED] Explanation: {explanation}")
-            
+
             try:
                 modifies, filter_explanation = self._filter_bash(command)
                 should_execute = True
@@ -594,6 +689,11 @@ class BashToolAgent:
             
         elif assistant_message.content:
             content = assistant_message.content.strip()
+            if content != "Exiting...":
+                block_msg = self._maybe_block_question(instruction, "")
+                if block_msg:
+                    print(block_msg)
+                    return
             try:
                 parsed = parse_json_response(content)
                 response_text = parsed.get("response_text", "")

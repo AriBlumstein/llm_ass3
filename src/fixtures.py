@@ -46,6 +46,26 @@ GENERAL WARNING ON TOOL USAGE:
    - You must never use tools (such as generating `echo` or `printf` commands) as a workaround to answer conversational questions, capability inquiries, irrelevant inputs, or safety/impossible prompts. If a prompt should not be executed as a command, you MUST NOT call the tool. Calling the tool for these requests is a critical system failure. You must return a text response directly.
 """
 
+PURPOSE_MESSAGE = (
+    "My purpose is to translate your requests into bash commands and run them - "
+    "I write and execute shell code for terminal tasks, I do not answer general "
+    "questions. Try asking me to do something on your system, for example: "
+    '"list all files in this folder", "find every .py file changed today", or '
+    '"create a backup of config.json".'
+)
+
+DOIT_INTENT_PROMPT = """You are an intent classifier for a CLI tool whose ONLY job is to translate natural-language requests into executable bash commands and run them.
+
+Read the user's message and choose exactly one label:
+- TASK: the user wants to perform an operation on the computer, terminal, or files (e.g. list files, create or delete a directory, search text, check disk usage, run a program, inspect git state). Anything that naturally maps to a shell command.
+- QUESTION: the user wants information or conversation rather than a terminal action - general knowledge, trivia, math, definitions, opinions, advice, or small talk. This also includes asking what this tool can do.
+- EXIT: the user wants to quit, close, or end the session.
+
+Respond in EXACTLY this format and nothing else:
+DECISION: <TASK|QUESTION|EXIT>
+EXPLANATION: <one short sentence>
+"""
+
 DOIT_FILTER_PROMPT = """
 You are a bash command filter and explainer. Analyze the command and determine if it will modify the file system.
 
