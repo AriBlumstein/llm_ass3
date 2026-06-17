@@ -8,8 +8,11 @@ if src_dir not in sys.path:
 
 from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT
 
+import os
 import re
 import json
+import shutil
+import functools
 import subprocess
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -55,6 +58,74 @@ class BashCommandInput(BaseModel):
         description="A short explanation of what this bash command will perform on the host system."
     )
 
+@functools.lru_cache(maxsize=1)
+def _resolve_bash() -> str:
+    """
+    Locate a bash executable usable by the *current* Python process.
+
+    This keeps the tool cross-platform: on Windows the Python interpreter is a
+    native process that cannot run a POSIX path like ``/bin/bash``, so we must
+    point subprocess at a real ``bash.exe`` (typically the one shipped with
+    Git for Windows).
+
+    Resolution order:
+      1. The ``DOIT_BASH`` environment variable - set by the ``doit`` wrapper,
+         which already resolves the correct platform-native path (Git Bash on
+         Windows, ``/bin/bash`` on Linux/macOS).
+      2. Well-known platform locations.
+      3. A PATH lookup. On Windows the System32 WSL stub is skipped, because it
+         executes inside a separate Linux VM and cannot see the Windows
+         filesystem the way Git Bash does.
+
+    Raises:
+        FileNotFoundError: if no usable bash executable can be found.
+    """
+    override = os.environ.get("DOIT_BASH")
+    if override and Path(override).exists():
+        return override
+
+    if os.name != "nt":
+        # Linux / macOS
+        for candidate in ("/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"):
+            if Path(candidate).exists():
+                return candidate
+        found = shutil.which("bash")
+        if found:
+            return found
+        return "bash"  # last resort - let the OS resolve it at exec time
+
+    # Windows: prefer Git Bash; avoid the WSL stub at System32\bash.exe.
+    candidates: List[str] = []
+
+    git_path = shutil.which("git")
+    if git_path:
+        # e.g. C:\Program Files\Git\cmd\git.exe -> C:\Program Files\Git
+        git_root = Path(git_path).resolve().parent.parent
+        candidates.append(str(git_root / "bin" / "bash.exe"))
+        candidates.append(str(git_root / "usr" / "bin" / "bash.exe"))
+
+    candidates += [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ]
+
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+
+    found = shutil.which("bash")
+    if found and "System32" not in found and "system32" not in found:
+        return found
+
+    raise FileNotFoundError(
+        "Could not locate a 'bash' executable. On Windows, install Git for Windows "
+        "(https://git-scm.com/download/win) so Git Bash is available, or set the "
+        "DOIT_BASH environment variable to a full path to bash.exe. On Linux/macOS, "
+        "ensure 'bash' is installed and on your PATH."
+    )
+
+
 def execute_bash(command: str, verbose: bool = True) -> str:
     """
     Executes a raw bash string in an isolated subprocess under strict constraints.
@@ -71,9 +142,16 @@ def execute_bash(command: str, verbose: bool = True) -> str:
         print(f"\n[EXEC] Running Command:\n{command}\n")
 
     try:
-        # We explicitly invoke bash as the shell shell binary rather than relying on default sh
+        # Resolve a real bash executable for the current platform (Git Bash on
+        # Windows, /bin/bash on Linux/macOS) rather than hardcoding a POSIX path.
+        bash_executable = _resolve_bash()
+    except FileNotFoundError as exc:
+        return f"[Error: {exc}]"
+
+    try:
+        # We explicitly invoke bash as the shell binary rather than relying on default sh
         result = subprocess.run(
-            ["/bin/bash", "-c", command],
+            [bash_executable, "-c", command],
             capture_output=True,
             text=True,
             timeout=15.0  # Safe execution timeout boundary to prevent infinite processes

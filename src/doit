@@ -1,13 +1,31 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Cross-platform launcher for the `doit` agent.
+# Works on Linux/macOS with any bash, and on Windows when run from
+# Git Bash / MSYS2 / Cygwin (e.g. `bash src/doit "list files"`).
 
-# 1. Get the absolute path of the directory where THIS script lives (the src folder)
+set -euo pipefail
+
+# 1. Absolute path of the directory where THIS script lives (the src folder).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 2. Get the project root (one level up from src)
+# 2. Project root (one level up from src).
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# 3. Dynamically set PYTHONPATH using the resolved folder
-export PYTHONPATH="$SCRIPT_DIR"
+# 3. The interpreter launched by `uv run` may be a native Windows Python that
+#    cannot understand POSIX paths. On Git Bash/MSYS/Cygwin `cygpath -w`
+#    converts paths to the Windows form; on Linux/macOS they are used as-is.
+BASH_PATH="$(command -v bash)"
+PYTHONPATH_VALUE="$SCRIPT_DIR"
+if command -v cygpath >/dev/null 2>&1; then
+    BASH_PATH="$(cygpath -w "$BASH_PATH")"
+    PYTHONPATH_VALUE="$(cygpath -w "$SCRIPT_DIR")"
+fi
 
-# 4. Run uv pointing to the resolved project directory
-uv run --project "$PROJECT_ROOT" -m doit_module "$@"
+# 4. Tell the Python tool which bash to invoke for executing commands, and make
+#    the `doit_module` / sibling packages importable.
+export DOIT_BASH="$BASH_PATH"
+export PYTHONPATH="$PYTHONPATH_VALUE"
+
+# 5. Run the module through uv against the resolved project directory.
+exec uv run --project "$PROJECT_ROOT" -m doit_module "$@"

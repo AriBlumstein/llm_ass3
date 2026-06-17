@@ -1,0 +1,8 @@
+# Guarantee the shell launcher always has LF line endings, so it runs on
+# Linux/macOS even when the repo is cloned or edited on Windows (CRLF in a
+# shell script breaks the shebang: "bash\r: No such file or directory").
+src/doit text eol=lf
+*.sh      text eol=lf
+
+# Keep Python sources normalized to LF too.
+*.py      text eol=lf
