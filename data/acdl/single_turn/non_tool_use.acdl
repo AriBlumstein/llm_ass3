@@ -1,0 +1,26 @@
+// Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Single Turn)
+DoitNonToolUseAgent: {
+    // S: System instructions appended with Fallback JSON instructions
+    S: {
+        sys.doit_system_prompt
+        sys.fallback_system_instruction
+    }
+
+    // U: User's original natural language terminal instruction
+    U: env.user_input
+}
+
+// Secondary LLM Context: Bash Filter (Runs synchronously before execution)
+BashFilter: {
+    // S: Instructions to classify if the command modifies the filesystem
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    // U: The generated bash command to be verified
+    U: {
+        sys.overall_instruction
+        resp.doit_non_tool_use_agent_response
+    }
+
+}
