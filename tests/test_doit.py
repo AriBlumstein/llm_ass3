@@ -533,19 +533,21 @@ def test_cli_new_resets_history(tmp_path, monkeypatch):
     # Mock sys.argv to run `doit -n` without instructions
     monkeypatch.setattr(sys, "argv", ["doit", "-n"])
 
-    # Mock sys.exit to capture exit code
-    exit_mock = MagicMock()
-    monkeypatch.setattr(sys, "exit", exit_mock)
+    # Mock sys.exit to raise SystemExit
+    def mock_exit(code):
+        raise SystemExit(code)
+    monkeypatch.setattr(sys, "exit", mock_exit)
 
     # Mock print to avoid stdout noise
     print_mock = MagicMock()
     monkeypatch.setattr("builtins.print", print_mock)
 
-    main()
+    with pytest.raises(SystemExit) as excinfo:
+        main()
 
     # History should be cleared
     assert len(history_manager.get_history_metadata()) == 0
-    exit_mock.assert_called_once_with(0)
+    assert excinfo.value.code == 0
     print_mock.assert_any_call("Session history cleared and new session started.")
 
 
@@ -555,17 +557,19 @@ def test_cli_no_args_prints_help(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["doit"])
 
-    exit_mock = MagicMock()
-    monkeypatch.setattr(sys, "exit", exit_mock)
+    def mock_exit(code):
+        raise SystemExit(code)
+    monkeypatch.setattr(sys, "exit", mock_exit)
 
     import argparse
     help_mock = MagicMock()
     monkeypatch.setattr(argparse.ArgumentParser, "print_help", help_mock)
 
-    main()
+    with pytest.raises(SystemExit) as excinfo:
+        main()
 
     help_mock.assert_called_once()
-    exit_mock.assert_called_once_with(1)
+    assert excinfo.value.code == 1
 
 
 def test_history_system_instruction_rules():
@@ -585,10 +589,82 @@ def test_doit_system_prompt_cancelled_rules():
     assert "CANCELLED" in DOIT_SYSTEM_PROMPT or "cancelled" in DOIT_SYSTEM_PROMPT
     assert "REJECTED" in DOIT_SYSTEM_PROMPT or "rejected" in DOIT_SYSTEM_PROMPT
     assert "since the previous step/s was not executed, doing a command here does not make sense" in DOIT_SYSTEM_PROMPT
+def test_doit_system_prompt_missing_context_rules():
+    """Verify DOIT_SYSTEM_PROMPT Rule 7 details how missing previous context is handled."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    
+    assert "I do not see any previous command within the current window that applies to this" in DOIT_SYSTEM_PROMPT
 
 
+@patch("builtins.print")
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_json_error_parsing(mock_completion, mock_print, tmp_path, monkeypatch):
+    """Verify that if the LLM returns JSON with an error key, it parses and prints it correctly."""
+    from llm_communicator import history_manager
+    test_file = tmp_path / "test_error_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+
+    # Setup mock LLM behavior:
+    # First call (analyze_references): returns empty dependency list
+    msg_analyze = MockMessage(content='{"relevant_ids": []}')
+    # Second call (main execution): returns JSON error response
+    msg_execute = MockMessage(content='{"error": "error from qwen"}')
+
+    mock_completion.return_value = MockResponse(msg_execute)
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    agent.run_single("some prompt")
+
+    mock_print.assert_any_call("error from qwen")
 
 
+def test_doit_system_prompt_augmented_rules():
+    """Verify DOIT_SYSTEM_PROMPT Rule 7 details connection matching and generation strategies."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    
+    assert "connect to the previous command based on either the command itself or its prompt" in DOIT_SYSTEM_PROMPT
+    assert "Appending/chaining/piping" in DOIT_SYSTEM_PROMPT
+    assert "Working on the output" in DOIT_SYSTEM_PROMPT
+    assert "Understanding the previous prompt to know the user's intentions" in DOIT_SYSTEM_PROMPT
+def test_doit_system_prompt_filesystem_metadata_rules():
+    """Verify DOIT_SYSTEM_PROMPT Rule 7 details filesystem metadata / properties checking rule."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    
+    assert "neither the previous command nor its output contains the necessary metadata or attributes" in DOIT_SYSTEM_PROMPT
+    assert "generate a new Bash command to query the filesystem directly to retrieve the needed information" in DOIT_SYSTEM_PROMPT
+    assert "invoke the `execute_bash_command` tool" in DOIT_SYSTEM_PROMPT
 
+def test_rejection_warning_direct_response(tmp_path, monkeypatch):
+    """Verify that if the LLM returns a contextual warning rejection inside a JSON content response, it is printed/logged without execution."""
+    from llm_communicator import history_manager
+    test_file = tmp_path / "test_rejection_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
 
+    # Mock analyze references to return empty dependencies, then direct warning JSON in content
+    msg_execute = MockMessage(content='{"response_text": "I do not see any previous command within the current window that applies to this"}')
 
+    with patch("builtins.print") as mock_print, patch("llm_communicator.llm_bash.litellm.completion") as mock_completion:
+        mock_completion.return_value = MockResponse(msg_execute)
+
+        # Patch execute_bash to ensure it is never called
+        mock_execute_bash = MagicMock(return_value="should not be executed")
+        monkeypatch.setattr("llm_communicator.llm_bash.execute_bash", mock_execute_bash)
+
+        agent = BashToolAgent(api_key="fake-key")
+        agent.tool_calling = True
+
+        agent.run_single("delete the file we just created")
+
+        # Assert that print was called with the warning string
+        mock_print.assert_any_call("I do not see any previous command within the current window that applies to this")
+        # Verify that execute_bash was NOT called
+        mock_execute_bash.assert_not_called()
+
+    # Verify history entry
+    assert test_file.exists()
+    with open(test_file, "r", encoding="utf-8") as f:
+        turn = json.loads(f.readline().strip())
+        assert turn["command"] == ""
+        assert turn["output"] == "I do not see any previous command within the current window that applies to this"

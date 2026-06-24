@@ -6,7 +6,7 @@ src_dir = str(Path(__file__).resolve().parent.parent)
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT
+from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT, LLM_CONTEXT_LIMIT
 from doit_module.config_loader import load_config
 import llm_communicator.history_manager as history_manager
 
@@ -262,7 +262,9 @@ tools_definition: List[Dict[str, Any]] = [
                 "Executes a localized bash command on the host terminal environment. "
                 "Use this tool ONLY to execute the user's requested bash command. "
                 "DO NOT call this tool for general knowledge, questions, or irrelevant inputs "
-                "(e.g., do not generate 'echo' commands to answer questions)."
+                "(e.g., do not generate 'echo' commands to answer questions). "
+                "DO NOT call this tool when returning the rejection warning 'I do not see any previous command within the current window that applies to this'. "
+                "Instead, for this warning, you MUST return a plain text response directly without any tool call."
             ),
             "parameters": BashCommandInput.model_json_schema()
         }
@@ -428,8 +430,8 @@ class BashToolAgent:
         """
         Coordinates a single user query execution.
         """
-        # 1. Fetch metadata for last 10 actions from history
-        metadata = history_manager.get_history_metadata(limit=10)
+        # 1. Fetch metadata for last 20 actions from history
+        metadata = history_manager.get_history_metadata(limit=LLM_CONTEXT_LIMIT)
         
         # 2. Query LLM to identify relevant previous turns
         llm_relevant_ids = self._analyze_references(instruction, metadata)
@@ -456,6 +458,8 @@ class BashToolAgent:
                 
                 command = turn.get("command", "")
                 output = turn.get("output", "")
+                if output and len(output) > 2000:
+                    output = output[:2000] + "\n... [TRUNCATED due to length]"
                 
                 if command:
                     tool_call_id = f"call_{turn['id']}"
@@ -497,6 +501,8 @@ class BashToolAgent:
                 prompt = turn["prompt"]
                 command = turn.get("command", "")
                 output = turn.get("output", "")
+                if output and len(output) > 2000:
+                    output = output[:2000] + "\n... [TRUNCATED due to length]"
                 
                 if user_content:
                     user_content += f"\n\n{prompt}"
@@ -563,6 +569,8 @@ class BashToolAgent:
                         args_data = json.loads(tool_call.function.arguments)
                         command_input = BashCommandInput(**args_data)
                         executed_command = command_input.command
+                        
+
 
                         print(f"[TOOL REQUESTED] Command: {command_input.command}")
                         print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
@@ -603,8 +611,10 @@ class BashToolAgent:
                 explanation = parsed.get("explanation", "")
                 response_text = parsed.get("response_text", "")
                 if not response_text:
-                    response_text = parsed.get("reason", "") or explanation
+                    response_text = parsed.get("reason", "") or parsed.get("error", "") or explanation
                 rule_triggered = parsed.get("rule_triggered")
+                
+
                 
                 # Backward compatible executable check
                 executable = parsed.get("executable", bool(command and command != "bash: command not found"))
@@ -656,7 +666,7 @@ class BashToolAgent:
                 parsed = parse_json_response(content)
                 response_text = parsed.get("response_text", "")
                 if not response_text:
-                    response_text = parsed.get("reason", "") or parsed.get("explanation", "")
+                    response_text = parsed.get("reason", "") or parsed.get("error", "") or parsed.get("explanation", "")
                 if response_text:
                     print(response_text)
                     execution_output = response_text
