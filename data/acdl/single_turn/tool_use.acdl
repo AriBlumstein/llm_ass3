@@ -15,12 +15,12 @@ DoitToolUseAgent: {
 BashFilter: {
     // S: Instructions to classify if the command modifies the filesystem
     S: {
-        sys.doit_system_prompt
+        sys.doit_filter_prompt
     }
 
     // U: The generated bash command to be verified
     U: {
-        sys.overall_instruction
+        sys.filter_user_instruction
         resp.doit_tool_use_agent_response
     }
 

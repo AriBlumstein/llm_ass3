@@ -62,6 +62,14 @@ class MockResponse:
         self.choices = [MockChoice(message)]
 
 
+@pytest.fixture(autouse=True)
+def isolate_history(tmp_path, monkeypatch):
+    """Automatically isolate all tests from the host's actual history file."""
+    from llm_communicator import history_manager
+    test_file = tmp_path / "test_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+
+
 # =====================================================================
 # SECTION 1: Config Loader Tests
 # =====================================================================
@@ -327,12 +335,260 @@ def test_run_single_tool_calling_reason_fallback_in_content(mock_print, mock_com
 
 
 def test_system_prompt_contains_anti_echo_warning():
-    """Verify that DOIT_SYSTEM_PROMPT contains specific instructions forbidding echo/printf workarounds."""
+    """Verify that DOIT_SYSTEM_PROMPT contains specific instructions forbidding echo/printf workarounds, and pipelining instructions."""
     from fixtures import DOIT_SYSTEM_PROMPT
     assert "echo" in DOIT_SYSTEM_PROMPT.lower()
     assert "printf" in DOIT_SYSTEM_PROMPT.lower()
     assert "irrelevant" in DOIT_SYSTEM_PROMPT.lower()
     assert "native tool calling" in DOIT_SYSTEM_PROMPT.lower()
+    assert "heredoc" in DOIT_SYSTEM_PROMPT.lower()
+    assert "cancelled" in DOIT_SYSTEM_PROMPT.lower()
+    assert "piping" in DOIT_SYSTEM_PROMPT.lower()
+
+
+
+# =====================================================================
+# SECTION 7: Selective History & Multi-turn Tests
+# =====================================================================
+
+def test_history_manager_basic_operations(tmp_path, monkeypatch):
+    """Verify that history_manager methods read, write, and clear history correctly."""
+    from llm_communicator import history_manager
+    
+    # Mock history file path to be in our temp directory
+    test_file = tmp_path / "test_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    
+    # Check initial states
+    assert history_manager.get_history_metadata() == []
+    assert history_manager.get_full_turns([1]) == []
+    
+    # Append turns
+    history_manager.append_history_turn("list files", "ls", "file1\nfile2")
+    history_manager.append_history_turn("show process", "ps", "pid 123")
+    
+    # Verify metadata (outputs omitted)
+    metadata = history_manager.get_history_metadata()
+    assert len(metadata) == 2
+    assert metadata[0] == {"id": 1, "prompt": "list files", "command": "ls"}
+    assert metadata[1] == {"id": 2, "prompt": "show process", "command": "ps"}
+    
+    # Verify full turns retrieval
+    full_turns = history_manager.get_full_turns([1])
+    assert len(full_turns) == 1
+    assert full_turns[0]["id"] == 1
+    assert full_turns[0]["prompt"] == "list files"
+    assert full_turns[0]["command"] == "ls"
+    assert full_turns[0]["output"] == "file1\nfile2"
+    
+    # Clear history
+    history_manager.clear_history()
+    assert not test_file.exists()
+    assert history_manager.get_history_metadata() == []
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_analyze_references_with_llm(mock_completion):
+    """Verify that analyze_references queries LLM and correctly parses relevant IDs."""
+    agent = BashToolAgent(api_key="fake-key")
+    
+    # Mock LLM response returning JSON
+    mock_message = MockMessage(content='{"relevant_ids": [1, 2]}')
+    mock_completion.return_value = MockResponse(mock_message)
+    
+    metadata = [
+        {"id": 1, "prompt": "list files", "command": "ls"},
+        {"id": 2, "prompt": "show process", "command": "ps"}
+    ]
+    
+    relevant = agent._analyze_references("sort them", metadata)
+    assert relevant == [1, 2]
+    
+    # Mock LLM returning empty or invalid
+    mock_message_empty = MockMessage(content='{"relevant_ids": []}')
+    mock_completion.return_value = MockResponse(mock_message_empty)
+    assert agent._analyze_references("hello", metadata) == []
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_agent_runs_with_selective_history(mock_execute_bash, mock_completion, tmp_path, monkeypatch):
+    """Verify agent correctly selective-retrieves and formats history messages in main prompt."""
+    from llm_communicator import history_manager
+    
+    test_file = tmp_path / "test_agent_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    
+    # 1. Setup existing history: 2 turns
+    history_manager.append_history_turn("list files", "ls", "file1\nfile2")
+    history_manager.append_history_turn("make dir", "mkdir src", "")
+    
+    # 2. Setup mock LLM behavior:
+    # First call (analyze_references): returns [1] (only the 'list files' turn is relevant to sorting)
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    # Second call (main execution): returns tool call to sort files
+    tool_call = MockToolCall("call_new", "execute_bash_command", {"command": "ls -S", "explanation": "sort files"})
+    msg_execute = MockMessage(tool_calls=[tool_call])
+    # Third call (filter command): returns False (does not modify)
+    msg_filter = MockMessage(content="FALSE")
+    
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(msg_execute),
+        MockResponse(msg_filter)
+    ]
+    
+    mock_execute_bash.return_value = "file2\nfile1"
+    
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    
+    agent.run_single("now sort them by size")
+    
+    # Verify that conversation history passed to main model included the retrieved turn 1 but not turn 2
+    history_roles = [msg["role"] for msg in agent.conversation_history]
+    assert "system" in history_roles
+    
+    # User message 1 (prompt of turn 1)
+    assert agent.conversation_history[1]["role"] == "user"
+    assert agent.conversation_history[1]["content"] == "list files"
+    
+    # Assistant message 1 (tool call for turn 1)
+    assert agent.conversation_history[2]["role"] == "assistant"
+    assert agent.conversation_history[2]["tool_calls"][0]["function"]["arguments"] == '{"command": "ls", "explanation": "execute ls"}'
+    
+    # Tool output (result of turn 1)
+    assert agent.conversation_history[3]["role"] == "tool"
+    assert agent.conversation_history[3]["content"] == "file1\nfile2"
+    
+    # User message 2 (the new instruction)
+    assert agent.conversation_history[4]["role"] == "user"
+    assert agent.conversation_history[4]["content"] == "now sort them by size"
+    
+    # Verify the third action ("make dir") was excluded from the context
+    for msg in agent.conversation_history:
+        if msg.get("content") == "make dir" or msg.get("content") == "mkdir src":
+            pytest.fail("Excluded history turn was incorrectly included in LLM context")
+            
+    # Verify new turn was appended to history file
+    metadata = history_manager.get_history_metadata()
+    assert len(metadata) == 3
+    assert metadata[2]["prompt"] == "now sort them by size"
+    assert metadata[2]["command"] == "ls -S"
+
+
+def test_resolve_transitive_dependencies(tmp_path, monkeypatch):
+    """Verify that _resolve_transitive_dependencies correctly resolves transitively chained dependencies."""
+    from llm_communicator import history_manager
+    test_file = tmp_path / "test_transitive_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+
+    # Turn 1: independent
+    history_manager.append_history_turn("list files", "ls", "file1\nfile2", relevant_ids=[])
+    # Turn 2: depends on Turn 1
+    history_manager.append_history_turn("find executable", "find . -perm /111", "", relevant_ids=[1])
+    # Turn 3: depends on Turn 2
+    history_manager.append_history_turn("sort them", "sort", "", relevant_ids=[2])
+
+    agent = BashToolAgent(api_key="fake-key")
+    
+    # Resolve deps for Turn 3 (starts with [2])
+    resolved = agent._resolve_transitive_dependencies([2])
+    assert resolved == [1, 2]
+
+    # Resolve deps for independent or empty
+    assert agent._resolve_transitive_dependencies([]) == []
+    assert agent._resolve_transitive_dependencies([1]) == [1]
+
+
+def test_find_project_root(tmp_path, monkeypatch):
+    """Verify that find_project_root finds the root based on project markers."""
+    from llm_communicator import history_manager
+    
+    # Create a dummy structure: root/subdir
+    root_dir = tmp_path / "project_root"
+    subdir = root_dir / "subdir"
+    subdir.mkdir(parents=True)
+    
+    # Place a marker (pyproject.toml) in root
+    (root_dir / "pyproject.toml").touch()
+    
+    # Mock Path.cwd() to return subdir
+    monkeypatch.setattr(Path, "cwd", lambda: subdir)
+    
+    # find_project_root should find root_dir
+    resolved = history_manager.find_project_root()
+    assert resolved == root_dir.resolve()
+
+
+def test_cli_new_resets_history(tmp_path, monkeypatch):
+    """Verify that 'doit -n' or 'doit --new' clears history and exits cleanly."""
+    from doit_module.__main__ import main
+    from llm_communicator import history_manager
+
+    # Write some history
+    history_manager.append_history_turn("list files", "ls", "file1\nfile2", relevant_ids=[])
+    assert len(history_manager.get_history_metadata()) == 1
+
+    # Mock sys.argv to run `doit -n` without instructions
+    monkeypatch.setattr(sys, "argv", ["doit", "-n"])
+
+    # Mock sys.exit to capture exit code
+    exit_mock = MagicMock()
+    monkeypatch.setattr(sys, "exit", exit_mock)
+
+    # Mock print to avoid stdout noise
+    print_mock = MagicMock()
+    monkeypatch.setattr("builtins.print", print_mock)
+
+    main()
+
+    # History should be cleared
+    assert len(history_manager.get_history_metadata()) == 0
+    exit_mock.assert_called_once_with(0)
+    print_mock.assert_any_call("Session history cleared and new session started.")
+
+
+def test_cli_no_args_prints_help(monkeypatch):
+    """Verify that 'doit' with no args prints help and exits with error code 1."""
+    from doit_module.__main__ import main
+
+    monkeypatch.setattr(sys, "argv", ["doit"])
+
+    exit_mock = MagicMock()
+    monkeypatch.setattr(sys, "exit", exit_mock)
+
+    import argparse
+    help_mock = MagicMock()
+    monkeypatch.setattr(argparse.ArgumentParser, "print_help", help_mock)
+
+    main()
+
+    help_mock.assert_called_once()
+    exit_mock.assert_called_once_with(1)
+
+
+def test_history_system_instruction_rules():
+    """Verify HISTORY_SYSYEM_INSTRUCTION contains the semantic matching, chronological, and safety check rules."""
+    from llm_communicator.llm_bash import HISTORY_SYSYEM_INSTRUCTION
+    
+    assert "semantic and logical dependencies" in HISTORY_SYSYEM_INSTRUCTION
+    assert "chronological order" in HISTORY_SYSYEM_INSTRUCTION
+    assert "SAFETY CHECK" in HISTORY_SYSYEM_INSTRUCTION
+    assert "most recent one (the command with the larger ID)" in HISTORY_SYSYEM_INSTRUCTION
+
+
+def test_doit_system_prompt_cancelled_rules():
+    """Verify DOIT_SYSTEM_PROMPT Rule 7 details how cancelled or rejected commands are handled."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    
+    assert "CANCELLED" in DOIT_SYSTEM_PROMPT or "cancelled" in DOIT_SYSTEM_PROMPT
+    assert "REJECTED" in DOIT_SYSTEM_PROMPT or "rejected" in DOIT_SYSTEM_PROMPT
+    assert "since the previous step/s was not executed, doing a command here does not make sense" in DOIT_SYSTEM_PROMPT
+
+
+
+
 
 
 

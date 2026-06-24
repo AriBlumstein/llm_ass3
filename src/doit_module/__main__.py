@@ -7,24 +7,44 @@ from llm_communicator.llm_bash import BashToolAgent, BashSafetyViolationError
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate natural language to shell commands and execute them.")
-    parser.add_argument("instruction", type=str, nargs="?", help="The natural language instruction to execute")
-    parser.add_argument("--max-iterations", type=int, default=5, help="Maximum number of iterations")
-
+    parser = argparse.ArgumentParser(
+        prog="doit",
+        description="Translate natural language to shell commands and execute them."
+    )
+    parser.add_argument(
+        "-n", "--new",
+        action="store_true",
+        help="Delete all history and start a new session"
+    )
+    parser.add_argument(
+        "instruction",
+        type=str,
+        nargs="?",
+        default=None,
+        help="The natural language instruction to execute"
+    )
     args = parser.parse_args()
 
-    max_iter = args.max_iterations
+    if not args.instruction:
+        if args.new:
+            try:
+                BashToolAgent(force_new=True)
+                print("Session history cleared and new session started.")
+                sys.exit(0)
+            except Exception as e:
+                print(f"An error occurred: {e}")
+                sys.exit(1)
+        else:
+            parser.print_help()
+            sys.exit(1)
 
     try:
-        llm = BashToolAgent()
-        if args.instruction:
-            llm.run_single(args.instruction)
-        else:
-            llm.run_agent_loop(max_iterations=max_iter)
+        llm = BashToolAgent(force_new=args.new)
+        llm.run_single(args.instruction)
     except BashSafetyViolationError as e:
         print(f"The command is not safe to execute: {e}")
     except subprocess.TimeoutExpired:
-        print("Command execution terminated due to exceeding 15.0s timeout limit")
+        print("Command execution terminated due to exceeding 20.0s timeout limit")
     except Exception as e:
         print(f"An error occurred: {e}")
 

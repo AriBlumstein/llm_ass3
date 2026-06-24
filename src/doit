@@ -26,6 +26,7 @@ fi
 #    the `doit_module` / sibling packages importable.
 export DOIT_BASH="$BASH_PATH"
 export PYTHONPATH="$PYTHONPATH_VALUE"
+export DOIT_PPID="${DOIT_PPID:-$PPID}"
 
 # 5. Run the module through uv against the resolved project directory.
 exec uv run --project "$PROJECT_ROOT" -m doit_module "$@"
