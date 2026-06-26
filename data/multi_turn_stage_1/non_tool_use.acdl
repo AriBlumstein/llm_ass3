@@ -7,18 +7,25 @@
 //
 // Same three sequential contexts as the tool-use scenario.
 
+<<<<<<< HEAD
 
 // 1. History Reference Resolver (_analyze_references)
 //    Identical context to the tool-use scenario (non-tool mode only adds a num_ctx runtime
 //    hint). One user message: the new instruction plus reverse-chronological, command-only
 //    metadata (id, prompt, command) capped at the last 20 turns.
 HistoryReferenceResolver[@T]: {
+=======
+// 1. History Reference Resolver: Identifies relevant prior turns at time step t
+HistoryReferenceResolver[@T]: {
+    // S: System instructions for history reference resolution
+>>>>>>> 8177e9b (fix acdl)
     S: {
         sys.history_system_instruction
     }
 
     U: {
         env.user_input[@T]
+<<<<<<< HEAD
         sys.history_metadata_reversed[@T]   // newest-first; command-bearing turns only; fields: [id, prompt, command]
     }
 }
@@ -30,11 +37,26 @@ HistoryReferenceResolver[@T]: {
 //    folded into the next user message (prepended as "Command execution output:\n<output>"),
 //    never sent as its own message.
 DoitNonToolUseAgent[@T]: {
+=======
+        
+    }
+        ForEach(@t: range(1, @T-1)){
+        U: {
+            sys.history_ppid_metadata[@t]
+        }
+    }
+}
+
+// 2. Doit Main Agent: Generates command at time step t using loaded history context
+DoitNonToolUseAgent[@T]: {
+    // S: System instructions appended with Fallback JSON instructions
+>>>>>>> 8177e9b (fix acdl)
     S: {
         sys.doit_system_prompt
         sys.fallback_system_instruction
     }
 
+<<<<<<< HEAD
     // Resolved + transitively chained relevant turn ids, ascending order.
     ForEach(@t: sys.relevant_ids[@T]) {
         U: {
@@ -61,12 +83,48 @@ DoitNonToolUseAgent[@T]: {
 //    Invoked only when the parsed fallback JSON has "executable": true. One user message:
 //    the fixed question concatenated with the parsed command. Classifies DECISION: YES / NO.
 BashFilter[@T]: {
+=======
+    // U: Reconstructed history of transitively resolved relevant turns [1..k] in alternating user-assistant roles
+    U: {
+        ForEach(@t: range(1, @T-1)) {
+            // FIXED: Using 'in' to evaluate if the turn index (@t) is part of the relevant turns array
+            if (@t in: sys.history_relevant_turns[@T]) {
+                U: {
+                    sys.history_ppid[@t].prompt
+                }
+                
+                if (sys.history_ppid_metadata[@t].command != "") {
+                    T: {
+                        sys.history_ppid[@t].command
+                        sys.history_ppid[@t].output
+                    }
+                } 
+                else {
+                    A: {
+                        sys.history_ppid[@t].output
+                    }
+                }
+            }
+        }
+        U: env.user_input[@T]
+    }
+}
+
+// 3. Bash Filter: Runs synchronously if a filesystem-modifying command was generated
+BashFilter[@T]: {
+    // S: Instructions to classify if the command modifies the filesystem
+>>>>>>> 8177e9b (fix acdl)
     S: {
         sys.doit_filter_prompt
     }
 
     U: {
+<<<<<<< HEAD
         sys.filter_user_instruction         // "Does the following command modify the file system?"
         resp.doit_non_tool_use_agent_response[@T].command   // "command" field parsed from the fallback JSON
+=======
+        sys.filter_user_instruction
+        resp.doit_non_tool_use_agent_response[@T]
+>>>>>>> 8177e9b (fix acdl)
     }
 }
