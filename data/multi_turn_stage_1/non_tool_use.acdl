@@ -1,55 +1,72 @@
 // Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Multi-Turn Stage 1)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = false). The model has no native
+// tool calling, so it must emit a raw fallback-JSON block and execution output is fed back
+// as a USER message. To keep STRICTLY alternating user/assistant roles, each turn's output
+// is folded into the FOLLOWING user message instead of being sent on its own.
+//
+// Same three sequential contexts as the tool-use scenario.
 
-// 1. History Reference Resolver: Identifies relevant prior turns at time step t
-HistoryReferenceResolver: {
-    // S: System instructions for history reference resolution
+
+// 1. History Reference Resolver (_analyze_references)
+//    Identical context to the tool-use scenario (non-tool mode only adds a num_ctx runtime
+//    hint). One user message: the new instruction plus reverse-chronological, command-only
+//    metadata (id, prompt, command) capped at the last 20 turns.
+HistoryReferenceResolver[@T]: {
     S: {
         sys.history_system_instruction
     }
 
-    // U: The user's new instruction and the filtered, reverse-chronological metadata history
     U: {
-        env.user_input_t
-        env.filtered_history_metadata_t  // Excludes turns with empty commands, ordered newest to oldest
+        env.user_input[@T]
+        sys.history_metadata_reversed[@T]   // newest-first; command-bearing turns only; fields: [id, prompt, command]
     }
 }
 
-// 2. Doit Main Agent: Generates command at time step t using loaded history context
-DoitNonToolUseAgent: {
-    // S: System instructions appended with Fallback JSON instructions
+
+// 2. Doit Main Agent (DoitNonToolUseAgent)
+//    System prompt is extended with the fallback-JSON instructions. The resolved relevant
+//    turns replay as strictly alternating U/A pairs; the execution output of each turn is
+//    folded into the next user message (prepended as "Command execution output:\n<output>"),
+//    never sent as its own message.
+DoitNonToolUseAgent[@T]: {
     S: {
         sys.doit_system_prompt
         sys.fallback_system_instruction
     }
 
-    // U: Reconstructed history of transitively resolved relevant turns [1..k] in alternating user-assistant roles
-    U: {
-        for turn_i in resolved_relevant_turns_t {
-            U: turn_prompt_i
-            A: {
-                fallback_json: {
-                    executable: true
-                    command: turn_command_i
-                    explanation: "execute turn_command_i"
-                    rule_triggered: 1
-                }
-            }
-            U: "Command execution output:\n" + turn_output_i
+    // Resolved + transitively chained relevant turn ids, ascending order.
+    ForEach(@t: sys.relevant_ids[@T]) {
+        U: {
+            sys.folded_output[@t]           // preceding turn's "Command execution output:\n<output>"; empty for the first turn
+            sys.turn[@t].prompt
         }
-        U: env.user_input_t
+
+        If(sys.turn[@t].command != "") {
+            A: sys.fallback_json[@t]        // fallback JSON; fields: executable = true, command = sys.turn[@t].command, explanation = "execute <command>", rule_triggered = 1, response_text = ""
+        } Else {
+            A: sys.turn[@t].output          // turn produced no command: replayed as a plain assistant message
+        }
+    }
+
+    // Final user message: trailing output of the last command turn folded with the new instruction.
+    U: {
+        sys.folded_output[@T]               // last turn's "Command execution output:\n<output>"; empty if the last turn ran no command
+        env.user_input[@T]
     }
 }
 
-// 3. Bash Filter: Runs synchronously if a filesystem-modifying command was generated
-BashFilter: {
-    // S: Instructions to classify if the command modifies the filesystem
+
+// 3. Bash Filter (_filter_bash)
+//    Invoked only when the parsed fallback JSON has "executable": true. One user message:
+//    the fixed question concatenated with the parsed command. Classifies DECISION: YES / NO.
+BashFilter[@T]: {
     S: {
         sys.doit_filter_prompt
     }
 
-    // U: The generated bash command to be verified
     U: {
-        sys.filter_user_instruction
-        resp.doit_non_tool_use_agent_response_t
+        sys.filter_user_instruction         // "Does the following command modify the file system?"
+        resp.doit_non_tool_use_agent_response[@T].command   // "command" field parsed from the fallback JSON
     }
 }

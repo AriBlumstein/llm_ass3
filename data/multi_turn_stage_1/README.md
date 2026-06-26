@@ -6,14 +6,14 @@ This directory contains the Agentic Context Description Language (ACDL) specific
 
 ## ACDL Specifications
 
-* **[Tool-Use Scenario](file:///home/ayb19/projects/git-repos/LLM/llm_ass3/data/multi_turn_stage_1/tool_use.acdl)**: Describes the interaction and reference structure when the underlying LLM natively supports tool calling (function calling).
-* **[Non-Tool-Use Scenario](file:///home/ayb19/projects/git-repos/LLM/llm_ass3/data/multi_turn_stage_1/non_tool_use.acdl)**: Describes the fallback context structure when native tool calling is disabled and the agent relies on structured fallback JSON blocks.
+* **[Tool-Use Scenario](./tool_use.acdl)**: Describes the interaction and reference structure when the underlying LLM natively supports tool calling (function calling).
+* **[Non-Tool-Use Scenario](./non_tool_use.acdl)**: Describes the fallback context structure when native tool calling is disabled and the agent relies on structured fallback JSON blocks.
 
 ---
 
 ## Agent Logic Overview
 
-The entrypoint for the multi-turn execution is the [BashToolAgent.run_single](file:///home/ayb19/projects/git-repos/LLM/llm_ass3/src/llm_communicator/llm_bash.py#L450) method. In this stage, the agent dynamically reconstructs conversation history based on logical dependency chains resolved by the classifier LLM.
+The entrypoint for the multi-turn execution is the [BashToolAgent.run_single](../../src/llm_communicator/llm_bash.py#L457) method. In this stage, the agent dynamically reconstructs conversation history based on logical dependency chains resolved by the classifier LLM.
 
 ### 1. Tool-Use Scenario Flow
 
