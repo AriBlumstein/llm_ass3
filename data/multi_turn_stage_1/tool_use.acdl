@@ -1,0 +1,68 @@
+// Doit Agent Context: Tool Use Scenario (Multi-Turn Stage 1)
+
+// 1. History Reference Resolver: Identifies relevant prior turns at time step t
+HistoryReferenceResolver[@T]: {
+    // S: System instructions for history reference resolution
+    S: {
+        sys.history_system_instruction
+    }
+
+    // U: The user's new instruction and the filtered, reverse-chronological metadata history
+    U: {
+        env.user_input_t
+          // Excludes turns with empty commands, ordered newest to oldest
+    }
+    ForEach(@t: range(1, @T-1)){
+        U: {
+            sys.history_ppid_metadata[@t]
+        }
+    }
+}
+
+// 2. Doit Main Agent: Generates command at time step t using loaded history context
+DoitToolUseAgent[@T]: { 
+    // S: System instructions and available tools
+    S: {
+        sys.doit_system_prompt
+        sys.tools_definition
+    }
+
+    // U: Reconstructed history of transitively resolved relevant turns of [1...T-1] and the new user instruction at time step T
+    U: {
+        ForEach(@t: range(1, @T-1)) {
+            // FIXED: Using 'in' to evaluate if the turn index (@t) is part of the relevant turns array
+            if (@t in: sys.history_relevant_turns[@T]) {
+                U: {
+                    sys.history_ppid_metadata[@t].prompt
+                }
+                
+                if (sys.history_ppid_metadata[@t].command != "") {
+                    T: {
+                        sys.history_ppid_metadata[@t].command
+                        sys.history_ppid_metadata[@t].output
+                    }
+                } 
+                else {
+                    A: {
+                        sys.history_ppid_metadata[@t].output
+                    }
+                }
+            }
+        }
+        U: env.user_input[@T]
+    }
+}
+
+// 3. Bash Filter: Runs synchronously to check if afilesystem-modifying command was generated
+BashFilter[@T]: {
+    // S: Instructions to classify if the command modifies the filesystem
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    // U: The generated bash command to be verified
+    U: {
+        sys.filter_user_instruction
+        resp.doit_tool_use_agent_response[@T].tool_calls[0].arguments.command
+    }
+}

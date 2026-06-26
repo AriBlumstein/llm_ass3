@@ -6,7 +6,7 @@ src_dir = str(Path(__file__).resolve().parent.parent)
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT, LLM_CONTEXT_LIMIT
+from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT, LLM_CONTEXT_LIMIT, CTX_NUM
 from doit_module.config_loader import load_config
 import llm_communicator.history_manager as history_manager
 
@@ -100,18 +100,14 @@ FILTER_USER_INSTRUCTION = "Does the following command modify the file system?"
 
 HISTORY_SYSYEM_INSTRUCTION = (
     "You are a command-line history reference resolver.\n"
-    "Analyze the user's new instruction and determine if it refers to, depends on, or modifies "
-    "the results or execution of any of the recent commands listed below.\n\n"
-    "Follow these matching rules strictly:\n"
-    "1. Match follow-up commands based on semantic and logical dependencies rather than duplicate prompt text. For example, a request to delete a file refers to the preceding creation command of that file, not an older unrelated deletion command.\n"
-    "2. If a command depends on or refers to a previous turn, make sure to also include all preceding turns "
-    "in that dependency chain that are necessary to resolve the references (for example, if Turn C depends on Turn B, "
-    "and Turn B refers to Turn A, include both B and A to provide complete context).\n"
-    "3. Resolve matching references in chronological order, preferring the most recent match.\n"
-    "4. SAFETY CHECK: If you can match two different previous commands that are not connected to each other, you must ALWAYS choose/take the most recent one (the command with the larger ID).\n\n"
-    "Your output MUST be a JSON object containing a single key 'relevant_ids' mapping to a list of integer IDs (e.g., {\"relevant_ids\": [1, 3]}).\n"
-    "If the new instruction is completely independent or does not refer to any previous context, respond with {\"relevant_ids\": []}.\n"
-    "Do not include any conversational text or explanation outside the JSON block."
+    "Decide if the new instruction refers to any previous commands. Return a JSON object with 'relevant_ids'.\n"
+    "Rules:\n"
+    "1. If the command specifies a new file name or action directly (e.g. 'create a file called klum'), it is completely independent. Return {\"relevant_ids\": []}.\n"
+    "2. If it refers to previous outputs/files/results, resolve references in chronological order, preferring the most recent match based on semantic and logical dependencies.\n"
+    "   - You MUST link only to the actual command turn that successfully executed the action (e.g., touch/mkdir/ls).\n"
+    "   - DO NOT link to empty commands (\"command\": \"\"), failed/cancelled turns, or warning rejections.\n"
+    "3. SAFETY CHECK: If you can match two different previous commands that are not connected, choose the most recent one (the command with the larger ID).\n"
+    "Note: The recent command history is presented below from most recent to oldest."
 )
 
 
@@ -309,9 +305,35 @@ class BashToolAgent:
         if not history_metadata:
             return []
 
+        # Filter out turns that did not execute any command (empty command)
+        history_metadata = [t for t in history_metadata if t.get("command")]
+        if not history_metadata:
+            return []
+
+        # Quick heuristic check for independent instructions to assist small models
+        instruction_lower = instruction.lower()
+        context_indicators = [
+            "it", "them", "that", "those", "this", "these", "like", "mean", "meant", "the command", 
+            "the output", "the results", "re-run", "recursively", "again", "previous", "we just", "before",
+            "output", "results", "we listed", "we created", "we did", "we ran", "we made", "above", "how many"
+        ]
+        has_context_indicator = False
+        for indicator in context_indicators:
+            if indicator in ("it", "them", "that", "those", "this", "these", "like", "mean", "meant", "again", "before", "previous", "above"):
+                if re.search(r'\b' + re.escape(indicator) + r'\b', instruction_lower):
+                    has_context_indicator = True
+                    break
+            else:
+                if indicator in instruction_lower:
+                    has_context_indicator = True
+                    break
+
+        if not has_context_indicator:
+            return []
+
         formatted_history = "\n".join([
             f"- [ID: {t['id']}] Prompt: \"{t['prompt']}\" | Command: \"{t['command']}\""
-            for t in history_metadata
+            for t in reversed(history_metadata)
         ])
 
 
@@ -330,6 +352,8 @@ class BashToolAgent:
             }
             if self.api_base:
                 completion_params["api_base"] = self.api_base
+            if not self.tool_calling:
+                completion_params["num_ctx"] = CTX_NUM
 
             response = litellm.completion(**completion_params)
             content = response.choices[0].message.content.strip()
@@ -382,10 +406,10 @@ class BashToolAgent:
 
     def _filter_bash(self, command: str) -> tuple[bool, str]:
         """Filter for bash commands using LLM as a judge to determine if a command will modify file system."""
-        response = litellm.completion(
-            model=self.model_name,
-            api_base=self.api_base,
-            messages=[
+        completion_params = {
+            "model": self.model_name,
+            "api_base": self.api_base,
+            "messages": [
                 {
                     "role": "system",
                     "content": DOIT_FILTER_PROMPT
@@ -395,7 +419,11 @@ class BashToolAgent:
                     "content": FILTER_USER_INSTRUCTION + command
                 }
             ]
-        )
+        }
+        if not self.tool_calling:
+            completion_params["num_ctx"] = CTX_NUM
+
+        response = litellm.completion(**completion_params)
         content = response.choices[0].message.content.strip()
 
         decision = False
@@ -554,6 +582,8 @@ class BashToolAgent:
         if self.tool_calling:
             completion_params["tools"] = tools_definition
             completion_params["tool_choice"] = "auto"
+        else:
+            completion_params["num_ctx"] = CTX_NUM
 
         response = litellm.completion(**completion_params)
         assistant_message = response.choices[0].message

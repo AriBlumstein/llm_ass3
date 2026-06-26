@@ -404,10 +404,18 @@ def test_analyze_references_with_llm(mock_completion):
     relevant = agent._analyze_references("sort them", metadata)
     assert relevant == [1, 2]
     
+    # Since the heuristic is active, self-contained queries like "hello" do not call the LLM
+    mock_completion.reset_mock()
+    mock_completion.return_value = MockResponse(mock_message)
+    assert agent._analyze_references("hello", metadata) == []
+    assert not mock_completion.called
+
     # Mock LLM returning empty or invalid
+    mock_completion.reset_mock()
     mock_message_empty = MockMessage(content='{"relevant_ids": []}')
     mock_completion.return_value = MockResponse(mock_message_empty)
-    assert agent._analyze_references("hello", metadata) == []
+    assert agent._analyze_references("do this instead", metadata) == []
+    assert mock_completion.called
 
 
 @patch("llm_communicator.llm_bash.litellm.completion")
@@ -668,3 +676,71 @@ def test_rejection_warning_direct_response(tmp_path, monkeypatch):
         turn = json.loads(f.readline().strip())
         assert turn["command"] == ""
         assert turn["output"] == "I do not see any previous command within the current window that applies to this"
+
+
+def test_ctx_num_passed_in_non_tool_calling():
+    """Verify that CTX_NUM is passed as num_ctx to litellm.completion in non-tool-calling mode."""
+    from fixtures import CTX_NUM
+    from llm_communicator.llm_bash import BashToolAgent
+    
+    with patch("llm_communicator.llm_bash.load_config") as mock_load_config, \
+         patch("llm_communicator.llm_bash.litellm.completion") as mock_completion, \
+         patch("llm_communicator.llm_bash.execute_bash", return_value="[Success]"), \
+         patch("builtins.input", return_value="y"):
+         
+        mock_load_config.return_value = ("gpt-5.4-nano", None, False)
+        
+        msg_gen = MockMessage(content='{"command": "mkdir -p new_folder", "explanation": "create folder"}')
+        msg_filter = MockMessage(content="DECISION: YES\\nEXPLANATION: Creates a folder")
+        
+        mock_completion.side_effect = [
+            MockResponse(msg_gen),
+            MockResponse(msg_filter)
+        ]
+        
+        agent = BashToolAgent()
+        agent.run_single("Make a folder")
+        
+        assert mock_completion.call_count >= 2
+        for call_args in mock_completion.call_args_list:
+            kwargs = call_args[1]
+            assert kwargs.get("num_ctx") == CTX_NUM
+
+
+def test_case2_self_contained_command_with_context(tmp_path, monkeypatch):
+    """Verify that a self-contained command (like 'create a file called klum') is executed even when context exists in the history."""
+    from llm_communicator import history_manager
+    test_file = tmp_path / "test_case2_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+
+    # 1. Setup existing history: 1 turn (e.g. list files)
+    history_manager.append_history_turn("list files in the cwd", "ls -l", "file1\nfile2")
+
+    # 2. Setup mock LLM behavior:
+    # First call (analyze_references): returns [1] (simulating reference match)
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    # Second call (main execution): returns tool call to create file 'klum'
+    tool_call = MockToolCall("call_1", "execute_bash_command", {"command": "touch klum", "explanation": "create file called klum"})
+    msg_execute = MockMessage(tool_calls=[tool_call])
+    # Third call (filter command): returns YES (modifies)
+    msg_filter = MockMessage(content="DECISION: YES\nEXPLANATION: Creates a file")
+
+    with patch("llm_communicator.llm_bash.litellm.completion") as mock_completion, \
+         patch("llm_communicator.llm_bash.execute_bash", return_value="[Success]") as mock_execute_bash, \
+         patch("builtins.input", return_value="y"):
+        
+        mock_completion.side_effect = [
+            MockResponse(msg_analyze),
+            MockResponse(msg_execute),
+            MockResponse(msg_filter)
+        ]
+
+        agent = BashToolAgent(api_key="fake-key")
+        agent.tool_calling = True
+
+        agent.run_single("create a file called klum instead of this")
+
+        # Verify that execute_bash was called to create the file
+        mock_execute_bash.assert_called_with("touch klum")
+
+

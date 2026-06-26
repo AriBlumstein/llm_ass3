@@ -1,0 +1,55 @@
+// Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Multi-Turn Stage 1)
+
+// 1. History Reference Resolver: Identifies relevant prior turns at time step t
+HistoryReferenceResolver: {
+    // S: System instructions for history reference resolution
+    S: {
+        sys.history_system_instruction
+    }
+
+    // U: The user's new instruction and the filtered, reverse-chronological metadata history
+    U: {
+        env.user_input_t
+        env.filtered_history_metadata_t  // Excludes turns with empty commands, ordered newest to oldest
+    }
+}
+
+// 2. Doit Main Agent: Generates command at time step t using loaded history context
+DoitNonToolUseAgent: {
+    // S: System instructions appended with Fallback JSON instructions
+    S: {
+        sys.doit_system_prompt
+        sys.fallback_system_instruction
+    }
+
+    // U: Reconstructed history of transitively resolved relevant turns [1..k] in alternating user-assistant roles
+    U: {
+        for turn_i in resolved_relevant_turns_t {
+            U: turn_prompt_i
+            A: {
+                fallback_json: {
+                    executable: true
+                    command: turn_command_i
+                    explanation: "execute turn_command_i"
+                    rule_triggered: 1
+                }
+            }
+            U: "Command execution output:\n" + turn_output_i
+        }
+        U: env.user_input_t
+    }
+}
+
+// 3. Bash Filter: Runs synchronously if a filesystem-modifying command was generated
+BashFilter: {
+    // S: Instructions to classify if the command modifies the filesystem
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    // U: The generated bash command to be verified
+    U: {
+        sys.filter_user_instruction
+        resp.doit_non_tool_use_agent_response_t
+    }
+}
