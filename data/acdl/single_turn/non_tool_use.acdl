@@ -20,7 +20,7 @@ BashFilter: {
     // U: The generated bash command to be verified
     U: {
         sys.filter_user_instruction
-        resp.doit_non_tool_use_agent_response
+        resp.doit_non_tool_use_agent_response.command
     }
 
 }

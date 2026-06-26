@@ -56,6 +56,6 @@ BashFilter[@T]: {
 
     U: {
         sys.filter_user_instruction
-        resp.doit_non_tool_use_agent_response[@T]
+        resp.doit_non_tool_use_agent_response[@T].command
     }
 }
