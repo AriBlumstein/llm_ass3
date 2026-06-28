@@ -16,6 +16,7 @@ from llm_communicator.llm_bash import (
     BashSafetyViolationError,
     execute_bash,
     parse_json_response,
+    NO_ANSWER_SENTINEL,
 )
 
 # Helpers to mock Chat Completion responses
@@ -60,6 +61,8 @@ class MockChoice:
 class MockResponse:
     def __init__(self, message):
         self.choices = [MockChoice(message)]
+
+
 
 
 @pytest.fixture(autouse=True)
@@ -220,7 +223,7 @@ def test_run_single_tool_calling_no_modification(mock_execute_bash, mock_complet
 
     agent = BashToolAgent(api_key="fake-key")
     agent.tool_calling = True
-    
+
     with patch("builtins.input") as mock_input:
         agent.run_single("Show me my files")
         mock_input.assert_not_called()
@@ -243,12 +246,12 @@ def test_run_single_non_tool_calling_approved(mock_input, mock_execute_bash, moc
     # Mock text output containing JSON command
     msg_gen = MockMessage(content='{"command": "mkdir -p new_folder", "explanation": "create folder"}')
     msg_filter = MockMessage(content="TRUE: Creates a new folder")
-    
+
     mock_completion.side_effect = [
         MockResponse(msg_gen),
         MockResponse(msg_filter)
     ]
-    
+
     mock_input.return_value = "y"
     mock_execute_bash.return_value = "[Success]"
     
@@ -276,12 +279,12 @@ def test_run_single_non_tool_calling_declined(mock_input, mock_execute_bash, moc
     # Mock text output containing JSON command
     msg_gen = MockMessage(content='{"command": "rm -rf old_folder", "explanation": "delete folder"}')
     msg_filter = MockMessage(content="TRUE: Deletes a folder")
-    
+
     mock_completion.side_effect = [
         MockResponse(msg_gen),
         MockResponse(msg_filter)
     ]
-    
+
     mock_input.return_value = "n"
     
     agent = BashToolAgent()
@@ -301,14 +304,14 @@ def test_run_single_non_tool_calling_reason_fallback(mock_print, mock_completion
     
     # Mock text output containing JSON with 'reason' instead of 'response_text'
     msg_gen = MockMessage(content='{"executable": false, "reason": "General knowledge question"}')
-    
+
     mock_completion.side_effect = [
         MockResponse(msg_gen)
     ]
-    
+
     agent = BashToolAgent()
     agent.run_single("can pigs fly")
-    
+
     # Check that the reason was printed
     mock_print.assert_any_call("General knowledge question")
 
@@ -322,14 +325,14 @@ def test_run_single_tool_calling_reason_fallback_in_content(mock_print, mock_com
     
     # Mock text output containing JSON in assistant_message.content (no tool calls)
     msg_gen = MockMessage(content='{"executable": false, "reason": "Pigs do not fly"}')
-    
+
     mock_completion.side_effect = [
         MockResponse(msg_gen)
     ]
-    
+
     agent = BashToolAgent()
     agent.run_single("can pigs fly")
-    
+
     # Check that the reason was printed
     mock_print.assert_any_call("Pigs do not fly")
 
@@ -445,33 +448,37 @@ def test_agent_runs_with_selective_history(mock_execute_bash, mock_completion, t
         MockResponse(msg_execute),
         MockResponse(msg_filter)
     ]
-    
+
     mock_execute_bash.return_value = "file2\nfile1"
-    
+
     agent = BashToolAgent(api_key="fake-key")
     agent.tool_calling = True
-    
+
     agent.run_single("now sort them by size")
     
     # Verify that conversation history passed to main model included the retrieved turn 1 but not turn 2
     history_roles = [msg["role"] for msg in agent.conversation_history]
     assert "system" in history_roles
-    
+
+    # Reconstructed real history begins after the system prompt + injected tool-calling few-shot.
+    from llm_communicator.backup_system_prompts import FEWSHOT_TOOLCALL
+    base = 1 + len(FEWSHOT_TOOLCALL)
+
     # User message 1 (prompt of turn 1)
-    assert agent.conversation_history[1]["role"] == "user"
-    assert agent.conversation_history[1]["content"] == "list files"
-    
+    assert agent.conversation_history[base]["role"] == "user"
+    assert agent.conversation_history[base]["content"] == "list files"
+
     # Assistant message 1 (tool call for turn 1)
-    assert agent.conversation_history[2]["role"] == "assistant"
-    assert agent.conversation_history[2]["tool_calls"][0]["function"]["arguments"] == '{"command": "ls", "explanation": "execute ls"}'
-    
+    assert agent.conversation_history[base + 1]["role"] == "assistant"
+    assert agent.conversation_history[base + 1]["tool_calls"][0]["function"]["arguments"] == '{"command": "ls", "explanation": "execute ls"}'
+
     # Tool output (result of turn 1)
-    assert agent.conversation_history[3]["role"] == "tool"
-    assert agent.conversation_history[3]["content"] == "file1\nfile2"
-    
+    assert agent.conversation_history[base + 2]["role"] == "tool"
+    assert agent.conversation_history[base + 2]["content"] == "file1\nfile2"
+
     # User message 2 (the new instruction)
-    assert agent.conversation_history[4]["role"] == "user"
-    assert agent.conversation_history[4]["content"] == "now sort them by size"
+    assert agent.conversation_history[base + 3]["role"] == "user"
+    assert agent.conversation_history[base + 3]["content"] == "now sort them by size"
     
     # Verify the third action ("make dir") was excluded from the context
     for msg in agent.conversation_history:
@@ -679,32 +686,56 @@ def test_rejection_warning_direct_response(tmp_path, monkeypatch):
 
 
 def test_ctx_num_passed_in_non_tool_calling():
-    """Verify that CTX_NUM is passed as num_ctx to litellm.completion in non-tool-calling mode."""
+    """Verify CTX_NUM is passed as num_ctx for a non-tool-calling OLLAMA model (num_ctx is an
+    Ollama-only option)."""
     from fixtures import CTX_NUM
     from llm_communicator.llm_bash import BashToolAgent
-    
+
     with patch("llm_communicator.llm_bash.load_config") as mock_load_config, \
          patch("llm_communicator.llm_bash.litellm.completion") as mock_completion, \
          patch("llm_communicator.llm_bash.execute_bash", return_value="[Success]"), \
          patch("builtins.input", return_value="y"):
-         
-        mock_load_config.return_value = ("gpt-5.4-nano", None, False)
-        
+
+        mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+
         msg_gen = MockMessage(content='{"command": "mkdir -p new_folder", "explanation": "create folder"}')
         msg_filter = MockMessage(content="DECISION: YES\\nEXPLANATION: Creates a folder")
-        
+
         mock_completion.side_effect = [
             MockResponse(msg_gen),
             MockResponse(msg_filter)
         ]
-        
+
         agent = BashToolAgent()
         agent.run_single("Make a folder")
-        
+
         assert mock_completion.call_count >= 2
         for call_args in mock_completion.call_args_list:
             kwargs = call_args[1]
             assert kwargs.get("num_ctx") == CTX_NUM
+
+
+def test_num_ctx_not_passed_for_openai_model():
+    """num_ctx must NOT be sent for an OpenAI model (it is Ollama-only), even in non-tool mode."""
+    from llm_communicator.llm_bash import BashToolAgent
+
+    with patch("llm_communicator.llm_bash.load_config") as mock_load_config, \
+         patch("llm_communicator.llm_bash.litellm.completion") as mock_completion, \
+         patch("llm_communicator.llm_bash.execute_bash", return_value="[Success]"), \
+         patch("builtins.input", return_value="y"):
+
+        mock_load_config.return_value = ("openai/gpt-5.4-nano", None, False)
+
+        msg_gen = MockMessage(content='{"command": "mkdir -p new_folder", "explanation": "create folder"}')
+        msg_filter = MockMessage(content="DECISION: YES\\nEXPLANATION: Creates a folder")
+        mock_completion.side_effect = [MockResponse(msg_gen), MockResponse(msg_filter)]
+
+        agent = BashToolAgent()
+        agent.run_single("Make a folder")
+
+        assert mock_completion.call_count >= 2
+        for call_args in mock_completion.call_args_list:
+            assert "num_ctx" not in call_args[1]
 
 
 def test_case2_self_contained_command_with_context(tmp_path, monkeypatch):
@@ -744,3 +775,240 @@ def test_case2_self_contained_command_with_context(tmp_path, monkeypatch):
         mock_execute_bash.assert_called_with("touch klum")
 
 
+# =====================================================================
+# SECTION 9: Clarifying Question Tests (tool decides, sub-LLM authors)
+# =====================================================================
+
+def _author(question, options=None):
+    """MockResponse for the _author_clarification sub-call."""
+    obj = {"question": question}
+    if options is not None:
+        obj["options"] = options
+    return MockResponse(MockMessage(content=json.dumps(obj)))
+
+
+@patch("llm_communicator.tools.litellm.completion")
+def test_author_clarification_parses(mock_completion):
+    """_author_clarification (in tools.py, configured from doit.cfg) turns the sub-call JSON
+    into (question, options)."""
+    from llm_communicator.tools import _author_clarification
+    mock_completion.return_value = _author("Which date?", ["a", "b"])
+    question, options = _author_clarification("sort by date")
+    assert question == "Which date?"
+    assert options == ["a", "b"]
+
+
+@patch("llm_communicator.tools.litellm.completion")
+def test_author_clarification_falls_back_on_junk(mock_completion):
+    """If the sub-call returns unparseable output, a generic question is produced."""
+    from llm_communicator.tools import _author_clarification
+    mock_completion.return_value = MockResponse(MockMessage(content="not json"))
+    question, options = _author_clarification("do the thing")
+    assert "do the thing" in question
+    assert options is None
+
+
+def test_ask_clarification_reprompts_on_out_of_range_choice():
+    """Picking a number outside the offered options re-shows the menu and re-prompts locally,
+    with NO call to the LLM, then resolves the valid pick to its option text."""
+    from llm_communicator.tools import ask_clarification
+    with patch("builtins.input", side_effect=["4", "2"]) as mock_input:
+        result = ask_clarification("Pick one:", ["alpha", "beta", "gamma"])
+    assert result == "beta"
+    assert mock_input.call_count == 2
+
+
+def test_ask_clarification_in_range_choice_maps_to_option():
+    """A valid numeric pick maps to the option text in a single prompt."""
+    from llm_communicator.tools import ask_clarification
+    with patch("builtins.input", side_effect=["3"]) as mock_input:
+        result = ask_clarification("Pick one:", ["alpha", "beta", "gamma"])
+    assert result == "gamma"
+    assert mock_input.call_count == 1
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_clarification_tool_calling(mock_execute_bash, mock_completion):
+    """Tool-calling: agent calls ask_user_clarification, the sub-call authors the question,
+    the user answers, and the agent then runs a command."""
+    clar_call = MockToolCall("call_clar", "ask_user_clarification", {"reason": "ambiguous date"})
+    exec_call = MockToolCall("call_exec", "execute_bash_command",
+                             {"command": "ls -lt ~", "explanation": "sort by mtime"})
+    mock_completion.side_effect = [
+        MockResponse(MockMessage(tool_calls=[clar_call])),     # generation -> clarify tool
+        _author("Which date?", ["modification date", "access date"]),  # sub-call authors
+        MockResponse(MockMessage(tool_calls=[exec_call])),     # generation -> command
+        MockResponse(MockMessage(content="DECISION: NO")),     # filter
+    ]
+    mock_execute_bash.return_value = "ok"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    with patch("builtins.input", return_value="modification date") as mock_input:
+        agent.run_single("list home folder sorted by date")
+        mock_input.assert_called()
+
+    tool_msgs = [m for m in agent.conversation_history
+                 if m.get("role") == "tool" and m.get("name") == "ask_user_clarification"]
+    assert tool_msgs and "modification date" in tool_msgs[-1]["content"]
+    mock_execute_bash.assert_called_once_with("ls -lt ~")
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_clarification_fallback(mock_execute_bash, mock_completion, mock_load_config):
+    """Fallback JSON: agent sets needs_clarification, sub-call authors, answer fed back, command runs."""
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    clar_json = json.dumps({"needs_clarification": True, "executable": False, "command": "", "rule_triggered": 8})
+    cmd_json = json.dumps({"executable": True, "command": "ls -lt ~", "explanation": "mtime"})
+    mock_completion.side_effect = [
+        MockResponse(MockMessage(content=clar_json)),          # generation -> needs_clarification
+        _author("Which date?", ["modification date", "access date"]),  # sub-call authors
+        MockResponse(MockMessage(content=cmd_json)),           # generation -> command
+        MockResponse(MockMessage(content="DECISION: NO")),     # filter
+    ]
+    mock_execute_bash.return_value = "ok"
+
+    agent = BashToolAgent()
+    assert agent.tool_calling is False
+
+    with patch("builtins.input", return_value="modification date") as mock_input:
+        agent.run_single("list home folder sorted by date")
+        mock_input.assert_called()
+
+    user_msgs = [m["content"] for m in agent.conversation_history if m.get("role") == "user"]
+    assert any("modification date" in c for c in user_msgs)
+    mock_execute_bash.assert_called_once_with("ls -lt ~")
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_clarification_empty_answer_uses_default(mock_execute_bash, mock_completion):
+    """Empty answer (twice) sends the sentinel back, and the agent proceeds with a default."""
+    clar_call = MockToolCall("call_clar", "ask_user_clarification", {})
+    exec_call = MockToolCall("call_exec", "execute_bash_command",
+                             {"command": "ls -lt ~", "explanation": "default mtime"})
+    mock_completion.side_effect = [
+        MockResponse(MockMessage(tool_calls=[clar_call])),
+        _author("Which date?"),
+        MockResponse(MockMessage(tool_calls=[exec_call])),
+        MockResponse(MockMessage(content="DECISION: NO")),
+    ]
+    mock_execute_bash.return_value = "ok"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    with patch("builtins.input", return_value="") as mock_input:
+        agent.run_single("list home folder sorted by date")
+        assert mock_input.call_count == 2
+
+    tool_msgs = [m for m in agent.conversation_history
+                 if m.get("role") == "tool" and m.get("name") == "ask_user_clarification"]
+    assert tool_msgs[-1]["content"] == NO_ANSWER_SENTINEL
+    mock_execute_bash.assert_called_once_with("ls -lt ~")
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_clarification_round_cap(mock_execute_bash, mock_completion):
+    """The agent stops asking after MAX_CLARIFICATION_ROUNDS and the clarify tool is withdrawn."""
+    from fixtures import MAX_CLARIFICATION_ROUNDS
+    clar = lambda: MockResponse(MockMessage(tool_calls=[
+        MockToolCall("call_clar", "ask_user_clarification", {})]))
+    # Each round: generation (clar) + author sub-call; final round generation only.
+    seq = []
+    for _ in range(MAX_CLARIFICATION_ROUNDS):
+        seq.append(clar())            # generation -> clar
+        seq.append(_author("Which?"))  # sub-call authors
+    seq.append(clar())                # final generation (clar tool withdrawn, still mocked as clar)
+    mock_completion.side_effect = seq
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    with patch("builtins.input", return_value="x"):
+        agent.run_single("do something ambiguous")
+
+    gen_calls = [c for c in mock_completion.call_args_list if "tools" in c.kwargs]
+    final_names = [t["function"]["name"] for t in gen_calls[-1].kwargs["tools"]]
+    assert "ask_user_clarification" not in final_names
+    assert "execute_bash_command" in final_names
+    mock_execute_bash.assert_not_called()
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_no_clarification_when_clear(mock_execute_bash, mock_completion):
+    """A clear request runs directly: no clarify tool call, no sub-call, no prompt."""
+    exec_call = MockToolCall("call_exec", "execute_bash_command",
+                             {"command": "ls -la", "explanation": "list files"})
+    mock_completion.side_effect = [
+        MockResponse(MockMessage(tool_calls=[exec_call])),
+        MockResponse(MockMessage(content="DECISION: NO")),
+    ]
+    mock_execute_bash.return_value = "file1"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    with patch("builtins.input") as mock_input:
+        agent.run_single("list files")
+        mock_input.assert_not_called()
+
+    mock_execute_bash.assert_called_once_with("ls -la")
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_clarification_folds_answer_into_persisted_prompt(mock_execute_bash, mock_completion, tmp_path, monkeypatch):
+    """The resolved clarification answer is folded into the prompt stored in history."""
+    from llm_communicator import history_manager
+    test_file = tmp_path / "clar_history.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+
+    clar_call = MockToolCall("call_clar", "ask_user_clarification", {})
+    exec_call = MockToolCall("call_exec", "execute_bash_command",
+                             {"command": "ls -lt ~", "explanation": "mtime"})
+    mock_completion.side_effect = [
+        MockResponse(MockMessage(tool_calls=[clar_call])),
+        _author("Which date?"),
+        MockResponse(MockMessage(tool_calls=[exec_call])),
+        MockResponse(MockMessage(content="DECISION: NO")),
+    ]
+    mock_execute_bash.return_value = "ok"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    with patch("builtins.input", return_value="modification date"):
+        agent.run_single("list home folder sorted by date")
+
+    turns = history_manager.get_history_metadata(limit=10)
+    assert turns
+    assert "[clarified: modification date]" in turns[-1]["prompt"]
+
+
+def test_author_prompt_documents_question():
+    """The clarification-authoring prompt asks for a question (and optional options)."""
+    from fixtures import CLARIFY_AUTHOR_PROMPT
+    assert '"question"' in CLARIFY_AUTHOR_PROMPT
+    assert '"options"' in CLARIFY_AUTHOR_PROMPT
+
+
+def test_system_prompt_contains_clarification_rule():
+    """DOIT_SYSTEM_PROMPT instructs the agent to ask for clarification when ambiguous."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    lowered = DOIT_SYSTEM_PROMPT.lower()
+    assert "clarif" in lowered
+    assert "ambiguous" in lowered
+    assert "ask_user_clarification" in DOIT_SYSTEM_PROMPT
+
+
+def test_fallback_instruction_documents_needs_clarification():
+    """The fallback JSON contract documents the needs_clarification flag."""
+    from llm_communicator.llm_bash import FALLBACK_SYSTEM_INSTRUCTION
+    assert "needs_clarification" in FALLBACK_SYSTEM_INSTRUCTION

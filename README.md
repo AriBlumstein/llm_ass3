@@ -1,7 +1,7 @@
 # llm_ass3
 
 `doit` - translate a natural-language instruction into a shell command and run it
-via an OpenAI model.
+via an OpenAI model or a local Ollama model.
 
 ## Setup
 

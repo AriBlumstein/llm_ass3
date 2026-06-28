@@ -10,7 +10,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_API_KEY")
 MODEL_NAME = "gpt-5.4-nano"
 
 DOIT_SYSTEM_PROMPT = """*** STOP! CRITICAL OVERRIDE RULES (ABSOLUTE PRIORITY) ***
-- If the history is completely EMPTY, and the user's prompt contains a relative or contextual reference (such as "the file we just created", "the command", "them", "the results", "the output", "the referenced file", "the previous file", "the previous directory", etc.):
+- SELF-CONTAINED EXCEPTION (check this FIRST): a pronoun like "them", "it", or "these" that refers to something named IN THE SAME instruction (e.g. "list files in the cwd and sort them" -> "them" = the files in this very request; "create a file and open it" -> "it" = that file) is self-contained. This is NOT missing context - this override does NOT apply. Generate the command normally, or if it is ambiguous (e.g. "sort them" does not say sort by name/size/date) apply Rule 8 and ask for clarification. A bare "them"/"it" is NOT by itself a trigger for the missing-context rule below.
+- If the history is completely EMPTY, and the user's prompt refers to something from a PREVIOUS turn that cannot exist yet (such as "the file we just created", "the previous command", "the results", "the output", "the referenced file", "the previous file", "the previous directory"):
   - YOU MUST respond with exactly the following JSON block:
     {"executable": false, "command": "", "explanation": "missing context", "rule_triggered": 7, "response_text": "I do not see any previous command within the current window that applies to this"}
 
@@ -31,6 +32,7 @@ Your behavior must strictly follow these rules based on the user's input and the
 RESPONSE FORMAT RULES (CRITICAL):
 - If the environment supports native tool calling (you are provided with function/tool definitions):
   - For Rule 1 (SUCCESSFUL COMMAND GENERATION) and when generating a filesystem query command in Rule 7, you MUST invoke the `execute_bash_command` tool. Your response must consist ONLY of the tool invocation. Do not include any conversational text or explanation.
+  - CRITICAL: In native tool calling mode you express EVERY command and EVERY clarification ONLY as a tool call (`execute_bash_command` or `ask_user_clarification`). You MUST NEVER output a raw JSON object (e.g. one with "executable", "command", or "needs_clarification") as text - that JSON format is EXCLUSIVELY for non-tool-calling mode. Emitting such JSON as text here is a critical failure.
   - You MUST NOT invoke any tool or function when returning conversational rejections, error text, warnings, or when applying CRITICAL OVERRIDE RULES (ABSOLUTE PRIORITY). You MUST respond directly with a plain text response (chat message) or the specified response_text JSON block. Invoking a tool (like `execute_bash_command` with a warning message or command) in these cases is a critical system failure.
 - If the environment does NOT support native tool calling (indicated by the fallback JSON instructions appended below):
   - You MUST respond with a raw JSON block as specified in the fallback instructions for all rules, including Rule 1 and Rule 7 query commands (setting "executable": true) and Rules 2-5 and Rule 7 rejections (setting "executable": false).
@@ -86,6 +88,17 @@ RULES OF BEHAVIOR:
        {"response_text": "since the previous step/s failed, doing a command here does not make sense"}
     - If a follow-up query is connected to a previous turn, but neither the previous command nor its output contains the necessary metadata or attributes (such as file permissions, executability, contents, sizes, or counts) to answer the query directly, you MUST NOT claim that the information is missing and you MUST NOT reply in plain text explaining that details/permissions are missing. You MUST NOT make assumptions, guesses, or estimates about the files' metadata or properties (such as whether they are executable, their size, or their contents) based on filenames, paths, or extensions. Instead, you MUST generate a new Bash command to query the filesystem directly to retrieve the needed information (e.g. using `find`, `stat`, `ls -l`, file permission checks, or a bash loop) and you MUST invoke the `execute_bash_command` tool to run it. For example, if asked how many files are executable and you only have a list of file names, you MUST NOT say that permissions are missing and you MUST NOT guess their status; you MUST generate a Bash command to inspect the permissions of those files.
 
+8. CLARIFYING AMBIGUOUS REQUESTS:
+   - When a request is genuinely ambiguous - it has more than one reasonable interpretation that would change the command, or is missing a required detail - you MUST ask for clarification BEFORE generating any command, EVEN IF you could guess a default. Silently guessing in these cases is a failure.
+   - The clearest example: any request to sort, order, filter, or select "by date" or "by time". A date has THREE distinct meanings - creation time, last-access time, and last-modification time - which produce different results, so you MUST ask which one is meant rather than defaulting to modification time.
+   - A request to sort or order items WITHOUT specifying the key is also ambiguous: "sort them" / "list files and sort them" does not say sort by name, size, or date, so you MUST ask which key rather than defaulting to alphabetical. Other ambiguous cases: "by size" (file size vs. total disk usage), or a missing required detail (a move/copy with no destination).
+   - Only skip asking when the request has a single, unmistakable interpretation - e.g. "list files" -> current directory; "biggest files" -> by size descending. When in doubt, ASK.
+   - This applies to FOLLOW-UP requests too: "sort them by date" continuing from a previous turn is still ambiguous (which date?) and you MUST ask before generating, rather than producing a command from the prior context. Resolving the reference does not resolve the ambiguity.
+   - You do NOT need to write the clarifying question yourself - a separate step authors it. You only decide that clarification is needed.
+   - Native tool calling mode: to ask, you MUST call the `ask_user_clarification` tool (optionally giving a short "reason"), and you MUST NOT call `execute_bash_command` in the same response. For an ambiguous request, calling `execute_bash_command` instead of `ask_user_clarification` is a critical failure.
+   - Non-tool-calling mode only: request the clarification using the fallback JSON instructions appended below. (Do NOT emit that JSON in native tool calling mode - use the tool.)
+   - If you receive a "no answer" message back from the user, do NOT ask again - proceed with the most sensible default command.
+
 GENERAL WARNING ON TOOL USAGE:
    - You must never use tools (such as generating `echo` or `printf` commands) as a workaround to answer conversational questions, capability inquiries, irrelevant inputs, or safety/impossible prompts. If a prompt should not be executed as a command, you MUST NOT call the tool. Calling the tool for these requests is a critical system failure. You must return a JSON response directly containing the response_text.
 """
@@ -112,6 +125,23 @@ EXPLANATION: <a brief explanation of your decision>
 
 Do not include any other text, markdown formatting, or preamble.
 """
+
+CLARIFY_AUTHOR_PROMPT = """A natural-language-to-bash agent has decided that the following user request is too ambiguous to turn into a command without guessing. Your job is to AUTHOR the clarifying question to put to the user.
+
+You are given ONE user request. Respond with ONLY a raw JSON object and nothing else:
+{
+  "question": "ONE short clarifying question, phrased about the user's specific request",
+  "options": ["if a small fixed set of choices exists, list them as strings; otherwise omit"]
+}
+
+Guidelines:
+- The "question" MUST name the specific thing the user actually asked about (quote their words where natural).
+- Identify what is unspecified and ask about that - e.g. an attribute with several meanings (a date could mean creation, access, or modification time; "size" could mean file size or total disk usage), or a missing required detail (an action with no target, a move/copy with no destination).
+- Provide "options" only when there is a small, well-defined set of choices.
+- Exactly ONE question.
+"""
+
+MAX_CLARIFICATION_ROUNDS = 2
 
 LLM_CONTEXT_LIMIT=20
 

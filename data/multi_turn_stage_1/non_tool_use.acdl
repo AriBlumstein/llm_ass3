@@ -34,7 +34,9 @@ HistoryReferenceResolver[@T]: {
 // 2. Doit Main Agent (DoitNonToolUseAgent)
 //    System prompt + fallback-JSON instructions, then the reconstructed history of the
 //    resolved relevant turns (with their transitive dependencies), then the new instruction.
-//    Each relevant turn replays as: user prompt -> assistant tool call -> tool result.
+//    Because we are still calling a tool, we use the tool-call documentation (the A:/T:
+//    notation, mirroring tool_use.acdl); how it is presented is different, to better mirror
+//    the way the LLM will actually see it — the inline comments below give that wire form.
 DoitNonToolUseAgent[@T]: {
     S: {
         sys.doit_system_prompt
@@ -46,8 +48,8 @@ DoitNonToolUseAgent[@T]: {
         U: sys.pid.turn[@t].prompt
 
         If(sys.pid.turn[@t].command != "") {
-            A: sys.pid.tool_call[@t]            // execute_bash_command tool call; args: command = sys.pid.turn[@t].command, explanation = "execute <command>"
-            T: sys.pid.turn[@t].output          // tool result; truncated to 2000 chars
+            A: sys.pid.tool_call[@t]            // logical execute_bash_command call; SERIALIZED as an assistant fallback-JSON block with executable=true, command, explanation="execute <command>", rule_triggered=1, response_text=""
+            T: sys.pid.turn[@t].output          // logical tool result; SERIALIZED as a USER message folded into the next turn's prompt ("Command execution output: <output>"); truncated to 2000 chars
         } Else {
             A: sys.turn[@t].output              // turn produced no command: replayed as a plain assistant message
         }
@@ -55,7 +57,6 @@ DoitNonToolUseAgent[@T]: {
 
     U: env.user_input[@T]
 }
-
 
 // 3. Bash Filter (_filter_bash)
 //    Invoked only when the main agent emits a command. One user message: the fixed
@@ -67,6 +68,6 @@ BashFilter[@T]: {
 
     U: {
         sys.filter_user_instruction         // "Does the following command modify the file system?"
-        resp.doit_non_tool_use_agent[@T].command   // command field of the fallback-JSON object emitted by the agent, when present (i.e., when the agent emitted a command)
+        resp.pid.doit_non_tool_use_agent[@T].command   // command field of the fallback-JSON object emitted by the agent, when present (i.e., when the agent emitted a command)
     }
 }

@@ -6,95 +6,33 @@ src_dir = str(Path(__file__).resolve().parent.parent)
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT, LLM_CONTEXT_LIMIT, CTX_NUM
+from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT, LLM_CONTEXT_LIMIT, CTX_NUM, MAX_CLARIFICATION_ROUNDS
 from doit_module.config_loader import load_config
 import llm_communicator.history_manager as history_manager
+from llm_communicator.backup_system_prompts import FALLBACK_SYSTEM_INSTRUCTION, FEWSHOT_FALLBACK, FEWSHOT_TOOLCALL
+from llm_communicator.tools import (
+    BashSafetyViolationError,
+    BashCommandInput,
+    execute_bash,
+    ask_user_clarification,
+    parse_json_response,
+    is_openai_model,
+    NO_ANSWER_SENTINEL,
+    EXECUTE_TOOL_DEF,
+    CLARIFY_TOOL_DEF,
+)
 
 import os
 import re
 import json
-import shutil
-import functools
-import subprocess
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
 
 import litellm
 
-# To protect the host system, we configure a basic blacklist of dangerous commands.
-BANNED_COMMAND_PATTERNS = [
-    r"\brm\s+-[rfRF]+.*\/",           # Root/dangerous recursive deletion
-    r"\bchmod\b.*777",                 # Dangerous wildcard permissions
-    r"\bkillall\b",                    # Indiscriminate process termination
-    r"\bshutdown\b",                   # Host shutdown command
-    r"\breboot\b",                     # Host reboot command
-    r"\bdd\s+if=/dev/zero",            # Zeroing out drives
-    r"\b:\(\)\{\s*:\s*&\s*:\s*\}; \s*:", # Classic fork bomb detection
-]
-
-FALLBACK_SYSTEM_INSTRUCTION = """IMPORTANT: You do not support native tool calling in this environment. Instead, you MUST respond with a raw JSON block containing exactly the following keys:
-- "executable": (boolean) true if a bash command is generated to execute, false if not.
-- "command": (string) the single-line or multi-line bash script to execute (only when executable is true, otherwise empty "").
-- "explanation": (string) a short explanation of what the command does, or why it is not executable.
-- "rule_triggered": (integer) the number of the system instruction rule triggered (1 for command generation, 2 for impossible, 3 for safety violation, 4 for irrelevant input, 5 for capability inquiry, 6 for assume file existence).
-- "response_text": (string) the conversational text, warning, or error message to display directly to the user (required when executable is false, e.g., "bash: command not found" for rule 2, or "The command is not safe to execute. <reason>" for rule 3).
-
-Do not include any other conversational text, pleasantries, markdown formatting (outside of the JSON block itself), or preamble.
-
-Example response for successful command:
-{
-  "executable": true,
-  "command": "ls -la",
-  "explanation": "list all files in the current directory",
-  "rule_triggered": 1,
-  "response_text": ""
-}
-
-Example response for impossible command (Rule 2):
-{
-  "executable": false,
-  "command": "",
-  "explanation": "Cannot perform this task as a bash command because <reason>",
-  "rule_triggered": 2,
-  "response_text": "bash: command not found"
-}
-
-Example response for safety violation (Rule 3):
-{
-  "executable": false,
-  "command": "",
-  "explanation": "Command attempts to recursively delete system root",
-  "rule_triggered": 3,
-  "response_text": "The command is not safe to execute. This would destroy your system directory."
-}
-
-Example response for irrelevant input (Rule 4):
-{
-  "executable": false,
-  "command": "",
-  "explanation": "The input is not related to executing bash commands",
-  "rule_triggered": 4,
-  "response_text": "My sole purpose is to execute bash commands. Your message is irrelevant."
-}
-
-Example response for capability inquiry (Rule 5):
-{
-  "executable": false,
-  "command": "",
-  "explanation": "The user is asking about my capabilities",
-  "rule_triggered": 5,
-  "response_text": "My purpose is to translate natural language descriptions into executable bash commands."
-}
-
-Example response for assuming file existence (Rule 6):
-{
-  "executable": true,
-  "command": "cat /etc/passwd",
-  "explanation": "Attempting to read the /etc/passwd file",
-  "rule_triggered": 6,
-  "response_text": ""
-}
-"""
+# Set DOIT_DEBUG=1 in the environment to print the agent's decision trace.
+def _debug(*args: Any) -> None:
+    if os.environ.get("DOIT_DEBUG"):
+        print("[DEBUG]", *args, flush=True)
 
 FILTER_USER_INSTRUCTION = "Does the following command modify the file system?"
 
@@ -112,160 +50,33 @@ HISTORY_SYSYEM_INSTRUCTION = (
 
 
 
-class BashSafetyViolationError(Exception):
-    """Raised when a generated bash command violates execution security policies."""
-    pass
+def _persist_prompt(instruction: str, clar_log: List[tuple]) -> str:
+    """
+    Fold any clarification answers into the prompt that gets stored in history, so later
+    reference-resolution turns understand the disambiguation. Returns the original
+    instruction unchanged when no (usable) clarification answer was collected.
+    """
+    if not clar_log:
+        return instruction
+    suffix = "; ".join(a for _, a in clar_log if a and a != NO_ANSWER_SENTINEL)
+    return f"{instruction} [clarified: {suffix}]" if suffix else instruction
 
-class BashCommandInput(BaseModel):
+
+def _clarification_followup(instruction: str, answer: str) -> str:
     """
-    Schema for the bash tool execution block.
-    This structure is automatically transformed into JSON Schema format for OpenAI.
+    Build the message fed back to the generator after the user answers a clarification. It
+    restates the FULL original request with the answer applied so the model treats it as a
+    self-contained instruction to execute now - not as a contextual follow-up (which would
+    otherwise trip the Rule 7 'missing context' rejection).
     """
-    command: str = Field(
-        ...,
-        description="The single line or multi-line bash script to execute in the local subshell."
+    if answer == NO_ANSWER_SENTINEL:
+        return answer
+    return (
+        f'The user clarified the request "{instruction}": {answer}. '
+        f"This fully resolves the ambiguity. Now generate the bash command for that request "
+        f"applying this clarification. Do NOT ask for clarification again, and do NOT reject "
+        f"this as missing context."
     )
-    explanation: str = Field(
-        ...,
-        description="A short explanation of what this bash command will perform on the host system."
-    )
-
-
-def parse_json_response(content: str) -> Dict[str, Any]:
-    """
-    Robust JSON parser that extracts JSON object {...} even if wrapped in markdown code blocks
-    or conversational text.
-    """
-    content = content.strip()
-    first_brace = content.find('{')
-    last_brace = content.rfind('}')
-    
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        json_str = content[first_brace:last_brace + 1]
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
-            
-    return json.loads(content)
-
-
-@functools.lru_cache(maxsize=1)
-def _resolve_bash() -> str:
-    """
-    Locate a bash executable usable by the *current* Python process.
-    """
-    override = os.environ.get("DOIT_BASH")
-    if override and Path(override).exists():
-        return override
-
-    if os.name != "nt":
-        # Linux / macOS
-        for candidate in ("/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"):
-            if Path(candidate).exists():
-                return candidate
-        found = shutil.which("bash")
-        if found:
-            return found
-        return "bash"
-
-    # Windows
-    candidates: List[str] = []
-    git_path = shutil.which("git")
-    if git_path:
-        git_root = Path(git_path).resolve().parent.parent
-        candidates.append(str(git_root / "bin" / "bash.exe"))
-        candidates.append(str(git_root / "usr" / "bin" / "bash.exe"))
-
-    candidates += [
-        r"C:\Program Files\Git\bin\bash.exe",
-        r"C:\Program Files\Git\usr\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\bin\bash.exe",
-    ]
-
-    for candidate in candidates:
-        if Path(candidate).exists():
-            return candidate
-
-    found = shutil.which("bash")
-    if found and "System32" not in found and "system32" not in found:
-        return found
-
-    raise FileNotFoundError("Could not locate a 'bash' executable.")
-
-
-def execute_bash(command: str, verbose: bool = True) -> str:
-    """
-    Executes a raw bash string in an isolated subprocess under strict constraints.
-    Returns stdout/stderr merged result as a single string.
-    """
-    for pattern in BANNED_COMMAND_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
-            raise BashSafetyViolationError(
-                f"Security Block: Command contains banned structural pattern matching '{pattern}'."
-            )
-
-    if verbose:
-        print(f"\n[EXEC] Running Command:\n{command}\n")
-
-    try:
-        bash_executable = _resolve_bash()
-    except FileNotFoundError as exc:
-        return f"[Error: {exc}]"
-
-    try:
-        result = subprocess.run(
-            [bash_executable, "-c", command],
-            capture_output=True,
-            text=True,
-            timeout=20.0
-        )
-
-        if not verbose:
-            output = ""
-            if result.stdout:
-                output += result.stdout
-            if result.stderr:
-                output += result.stderr
-            return output
-
-        output = ""
-        if result.stdout:
-            output += f"--- STDOUT ---\n{result.stdout}\n"
-        if result.stderr:
-            output += f"--- STDERR ---\n{result.stderr}\n"
-        if result.returncode is not None:
-            output += f"--- RETURN CODE ---\n{result.returncode}\n"
-
-        if not output:
-            output = "[Success: Command executed with no returning output channels]"
-
-        return output
-
-    except subprocess.TimeoutExpired:
-        return "[Error: Command Execution Terminated due to exceeding 15.0s Timeout Limit]"
-    except Exception as e:
-        return f"[Error occurred during system execution execution loop: {str(e)}]"
-
-
-# Defining the tools list using OpenAI/LiteLLM's standard format.
-tools_definition: List[Dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_bash_command",
-            "description": (
-                "Executes a localized bash command on the host terminal environment. "
-                "Use this tool ONLY to execute the user's requested bash command. "
-                "DO NOT call this tool for general knowledge, questions, or irrelevant inputs "
-                "(e.g., do not generate 'echo' commands to answer questions). "
-                "DO NOT call this tool when returning the rejection warning 'I do not see any previous command within the current window that applies to this'. "
-                "Instead, for this warning, you MUST return a plain text response directly without any tool call."
-            ),
-            "parameters": BashCommandInput.model_json_schema()
-        }
-    }
-]
 
 
 class BashToolAgent:
@@ -352,7 +163,7 @@ class BashToolAgent:
             }
             if self.api_base:
                 completion_params["api_base"] = self.api_base
-            if not self.tool_calling:
+            if not self.tool_calling and not is_openai_model(self.model_name):
                 completion_params["num_ctx"] = CTX_NUM
 
             response = litellm.completion(**completion_params)
@@ -420,7 +231,7 @@ class BashToolAgent:
                 }
             ]
         }
-        if not self.tool_calling:
+        if not self.tool_calling and not is_openai_model(self.model_name):
             completion_params["num_ctx"] = CTX_NUM
 
         response = litellm.completion(**completion_params)
@@ -454,20 +265,29 @@ class BashToolAgent:
 
         return True, explanation
 
+    def _build_tools(self, include_clarification: bool) -> List[Dict[str, Any]]:
+        """
+        Tools offered to the generator. The clarification tool is withdrawn on the final round
+        so the model must commit to a command instead of asking again.
+        """
+        if include_clarification:
+            return [EXECUTE_TOOL_DEF, CLARIFY_TOOL_DEF]
+        return [EXECUTE_TOOL_DEF]
+
     def run_single(self, instruction: str) -> None:
         """
         Coordinates a single user query execution.
         """
         # 1. Fetch metadata for last 20 actions from history
         metadata = history_manager.get_history_metadata(limit=LLM_CONTEXT_LIMIT)
-        
+
         # 2. Query LLM to identify relevant previous turns
         llm_relevant_ids = self._analyze_references(instruction, metadata)
         relevant_ids = self._resolve_transitive_dependencies(llm_relevant_ids)
-        
+
         # 3. Retrieve full records of identified relevant turns
         relevant_turns = history_manager.get_full_turns(relevant_ids)
-        
+
         # 4. Reconstruct conversation history starting with system prompt
         self.conversation_history = [
             {
@@ -478,6 +298,10 @@ class BashToolAgent:
         
         # 5. Populate history with relevant turns formatted correctly
         if self.tool_calling:
+            # Seed with in-context few-shot demonstrations of the clarification decision
+            # (ambiguous -> ask_user_clarification; clear -> execute_bash_command).
+            self.conversation_history.extend(FEWSHOT_TOOLCALL)
+
             for turn in relevant_turns:
                 self.conversation_history.append({
                     "role": "user",
@@ -523,7 +347,11 @@ class BashToolAgent:
                 "content": instruction
             })
         else:
-            # Fallback non-tool-calling mode: strict alternating user/assistant roles
+            # Fallback non-tool-calling mode: strict alternating user/assistant roles.
+            # Seed with in-context few-shot demonstrations of the clarification decision so
+            # weak local models reliably recognize ambiguous requests (e.g. "by date").
+            self.conversation_history.extend(FEWSHOT_FALLBACK)
+
             user_content = ""
             for turn in relevant_turns:
                 prompt = turn["prompt"]
@@ -566,150 +394,204 @@ class BashToolAgent:
                 user_content += f"\n\n{instruction}"
             else:
                 user_content = instruction
-                
+
             self.conversation_history.append({
                 "role": "user",
                 "content": user_content
             })
 
-        completion_params = {
-            "model": self.model_name,
-            "messages": self.conversation_history,
-        }
-        if self.api_base:
-            completion_params["api_base"] = self.api_base
-
-        if self.tool_calling:
-            completion_params["tools"] = tools_definition
-            completion_params["tool_choice"] = "auto"
-        else:
-            completion_params["num_ctx"] = CTX_NUM
-
-        response = litellm.completion(**completion_params)
-        assistant_message = response.choices[0].message
-        self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
-
         executed_command = ""
         execution_output = ""
+        clarifications_used = 0
+        clar_log = []   # (question, answer) pairs, folded into the persisted prompt
+        handled = False
 
-        if self.tool_calling and assistant_message.tool_calls:
-            for tool_call in assistant_message.tool_calls:
-                if tool_call.function.name == "execute_bash_command":
-                    try:
-                        args_data = json.loads(tool_call.function.arguments)
-                        command_input = BashCommandInput(**args_data)
-                        executed_command = command_input.command
-                        
+        while not handled:
+            rounds_remaining = MAX_CLARIFICATION_ROUNDS - clarifications_used
 
+            completion_params = {
+                "model": self.model_name,
+                "messages": self.conversation_history,
+            }
+            if self.api_base:
+                completion_params["api_base"] = self.api_base
 
-                        print(f"[TOOL REQUESTED] Command: {command_input.command}")
-                        print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
+            if self.tool_calling:
+                # Withdraw the clarification tool on the final round to force a command.
+                completion_params["tools"] = self._build_tools(rounds_remaining > 0)
+                completion_params["tool_choice"] = "auto"
+            elif not is_openai_model(self.model_name):
+                completion_params["num_ctx"] = CTX_NUM
 
-                        modifies, filter_explanation = self._filter_bash(command_input.command)
-                        should_execute = True
-                        if modifies:
-                            print(f"This command will modify your file system: {filter_explanation}")
-                            user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
-                            if user_choice not in ('y', 'yes'):
-                                should_execute = False
-                                execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
+            _debug(f"GEN call: tool_calling={self.tool_calling}, round_remaining={rounds_remaining}, "
+                   f"messages={len(self.conversation_history)}, "
+                   f"tools={[t['function']['name'] for t in completion_params.get('tools', [])]}")
+            _debug("GEN messages roles =", [m.get("role") for m in self.conversation_history])
+            _debug("GEN last user msg  =", repr(self.conversation_history[-1].get("content")))
 
-                        if should_execute:
-                            execution_result = execute_bash(command_input.command)
-                    except json.JSONDecodeError:
-                        execution_result = "[Error: Generated JSON arguments failed structure validation rules]"
-                    except BashSafetyViolationError as safety_err:
-                        execution_result = f"[Error: {str(safety_err)}]"
-                    except Exception as e:
-                        execution_result = f"[Error: Failed to process tool call arguments: {str(e)}]"
+            response = litellm.completion(**completion_params)
+            assistant_message = response.choices[0].message
+            self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
 
-                    print(f"[RESULT] Shell Response:\n{execution_result}")
-                    execution_output = execution_result
+            _debug("GEN response.tool_calls =",
+                   [(tc.function.name, tc.function.arguments) for tc in (assistant_message.tool_calls or [])])
+            _debug("GEN response.content   =", repr(assistant_message.content))
 
+            if self.tool_calling and assistant_message.tool_calls:
+                _debug("BRANCH: tool_calling + tool_calls")
+                clar_calls = [tc for tc in assistant_message.tool_calls
+                              if tc.function.name == "ask_user_clarification"]
+                if clar_calls and rounds_remaining > 0:
+                    # The agent decided it is ambiguous. The clarification tool authors the
+                    # question (its own LLM call) and asks the user; feed the answer back and
+                    # re-prompt the generator.
+                    answer = ask_user_clarification(instruction)
+                    clar_log.append((instruction, answer))
+                    followup = _clarification_followup(instruction, answer)
+                    for tool_call in assistant_message.tool_calls:
+                        body = followup if tool_call.function.name == "ask_user_clarification" \
+                            else "[Deferred: answer the clarification question first.]"
+                        self.conversation_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": body
+                        })
+                    clarifications_used += 1
+                    continue
+
+                for tool_call in assistant_message.tool_calls:
+                    if tool_call.function.name == "execute_bash_command":
+                        try:
+                            args_data = json.loads(tool_call.function.arguments)
+                            command_input = BashCommandInput(**args_data)
+                            executed_command = command_input.command
+
+                            print(f"[TOOL REQUESTED] Command: {command_input.command}")
+                            print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
+
+                            modifies, filter_explanation = self._filter_bash(command_input.command)
+                            should_execute = True
+                            if modifies:
+                                print(f"This command will modify your file system: {filter_explanation}")
+                                user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
+                                if user_choice not in ('y', 'yes'):
+                                    should_execute = False
+                                    execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
+
+                            if should_execute:
+                                execution_result = execute_bash(command_input.command)
+                        except json.JSONDecodeError:
+                            execution_result = "[Error: Generated JSON arguments failed structure validation rules]"
+                        except BashSafetyViolationError as safety_err:
+                            execution_result = f"[Error: {str(safety_err)}]"
+                        except Exception as e:
+                            execution_result = f"[Error: Failed to process tool call arguments: {str(e)}]"
+
+                        print(f"[RESULT] Shell Response:\n{execution_result}")
+                        execution_output = execution_result
+
+                        self.conversation_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": execution_result
+                        })
+                handled = True
+
+            elif not self.tool_calling and assistant_message.content:
+                _debug("BRANCH: fallback (parse JSON content)")
+                content = assistant_message.content
+                try:
+                    parsed = parse_json_response(content)
+                    _debug("fallback parsed =", parsed)
+                    command = parsed.get("command", "")
+                    explanation = parsed.get("explanation", "")
+                    response_text = parsed.get("response_text", "")
+                    if not response_text:
+                        response_text = parsed.get("reason", "") or parsed.get("error", "") or explanation
+                    rule_triggered = parsed.get("rule_triggered")
+
+                    # Backward compatible executable check
+                    executable = parsed.get("executable", bool(command and command != "bash: command not found"))
+                except Exception:
+                    # Fallback to direct conversational response
+                    print(content)
+                    history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", content, llm_relevant_ids)
+                    return
+
+                if parsed.get("needs_clarification") and rounds_remaining > 0:
+                    # The agent flagged ambiguity. The clarification tool authors the question
+                    # (its own LLM call) and asks the user; feed the answer back and re-prompt.
+                    answer = ask_user_clarification(instruction)
+                    clar_log.append((instruction, answer))
                     self.conversation_history.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "content": execution_result
+                        "role": "user",
+                        "content": _clarification_followup(instruction, answer)
                     })
-                    
-        elif not self.tool_calling and assistant_message.content:
-            content = assistant_message.content
-            try:
-                parsed = parse_json_response(content)
-                command = parsed.get("command", "")
-                explanation = parsed.get("explanation", "")
-                response_text = parsed.get("response_text", "")
-                if not response_text:
-                    response_text = parsed.get("reason", "") or parsed.get("error", "") or explanation
-                rule_triggered = parsed.get("rule_triggered")
-                
+                    clarifications_used += 1
+                    continue
 
-                
-                # Backward compatible executable check
-                executable = parsed.get("executable", bool(command and command != "bash: command not found"))
-            except Exception:
-                # Fallback to direct conversational response
-                print(content)
-                history_manager.append_history_turn(instruction, "", content, llm_relevant_ids)
-                return
+                if not executable:
+                    if response_text:
+                        print(response_text)
+                        history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", response_text, llm_relevant_ids)
+                    elif content:
+                        print(content)
+                        history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", content, llm_relevant_ids)
+                    return
 
-            if not executable:
-                if response_text:
-                    print(response_text)
-                    history_manager.append_history_turn(instruction, "", response_text, llm_relevant_ids)
-                elif content:
-                    print(content)
-                    history_manager.append_history_turn(instruction, "", content, llm_relevant_ids)
-                return
+                executed_command = command
+                print(f"[TEXT PARSED] Command: {command}")
+                print(f"[TEXT PARSED] Explanation: {explanation}")
 
-            executed_command = command
-            print(f"[TEXT PARSED] Command: {command}")
-            print(f"[TEXT PARSED] Explanation: {explanation}")
-            
-            try:
-                modifies, filter_explanation = self._filter_bash(command)
-                should_execute = True
-                if modifies:
-                    print(f"This command will modify your file system: {filter_explanation}")
-                    user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
-                    if user_choice not in ('y', 'yes'):
-                        should_execute = False
-                        execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
-                        
-                if should_execute:
-                    execution_result = execute_bash(command)
-            except Exception as e:
-                execution_result = f"[Error: Fallback JSON parsing/execution failed: {str(e)}]"
-                
-            print(f"[RESULT] Shell Response:\n{execution_result}")
-            execution_output = execution_result
-            
-            self.conversation_history.append({
-                "role": "user",
-                "content": f"Command execution output:\n{execution_result}"
-            })
-            
-        elif assistant_message.content:
-            content = assistant_message.content.strip()
-            try:
-                parsed = parse_json_response(content)
-                response_text = parsed.get("response_text", "")
-                if not response_text:
-                    response_text = parsed.get("reason", "") or parsed.get("error", "") or parsed.get("explanation", "")
-                if response_text:
-                    print(response_text)
-                    execution_output = response_text
-                else:
-                    print(content)
-                    execution_output = content
-            except Exception:
-                print(assistant_message.content)
-                execution_output = assistant_message.content
-        else:
-            print("Error Unknown")
-            execution_output = "Error Unknown"
+                try:
+                    modifies, filter_explanation = self._filter_bash(command)
+                    should_execute = True
+                    if modifies:
+                        print(f"This command will modify your file system: {filter_explanation}")
+                        user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
+                        if user_choice not in ('y', 'yes'):
+                            should_execute = False
+                            execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
+
+                    if should_execute:
+                        execution_result = execute_bash(command)
+                except Exception as e:
+                    execution_result = f"[Error: Fallback JSON parsing/execution failed: {str(e)}]"
+
+                print(f"[RESULT] Shell Response:\n{execution_result}")
+                execution_output = execution_result
+
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": f"Command execution output:\n{execution_result}"
+                })
+                handled = True
+
+            elif assistant_message.content:
+                _debug("BRANCH: trailing content (tool_calling model returned TEXT, no tool call)")
+                content = assistant_message.content.strip()
+                try:
+                    parsed = parse_json_response(content)
+                    response_text = parsed.get("response_text", "")
+                    if not response_text:
+                        response_text = parsed.get("reason", "") or parsed.get("error", "") or parsed.get("explanation", "")
+                    if response_text:
+                        print(response_text)
+                        execution_output = response_text
+                    else:
+                        print(content)
+                        execution_output = content
+                except Exception:
+                    print(assistant_message.content)
+                    execution_output = assistant_message.content
+                handled = True
+            else:
+                print("Error Unknown")
+                execution_output = "Error Unknown"
+                handled = True
 
         # Log new turn to history
         if executed_command or execution_output:
-            history_manager.append_history_turn(instruction, executed_command, execution_output, llm_relevant_ids)
+            history_manager.append_history_turn(_persist_prompt(instruction, clar_log), executed_command, execution_output, llm_relevant_ids)

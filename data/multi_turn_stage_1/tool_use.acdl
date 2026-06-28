@@ -63,6 +63,6 @@ BashFilter[@T]: {
 
     U: {
         sys.filter_user_instruction         // "Does the following command modify the file system?"
-        resp.doit_tool_use_agent[@T].tool_call[0].command   // command arg of the generated execute_bash_command call
+        resp.pid.doit_tool_use_agent[@T].tool_call[0].command   // command arg of the generated execute_bash_command call
     }
 }
