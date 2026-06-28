@@ -1356,3 +1356,227 @@ def test_fallback_execute_route_falls_through_without_suggestion(mock_execute_ba
     mock_execute_bash.assert_not_called()
     from llm_communicator import history_manager
     assert history_manager.get_history_metadata() == []  # nothing junk persisted
+
+
+
+# =====================================================================
+# SECTION: cd / shell-state persistence (hoist to the parent shell)
+# =====================================================================
+
+def test_resolve_cd_hoist_existing_dir(tmp_path):
+    from llm_communicator.tools import resolve_cd_hoist
+    assert resolve_cd_hoist(f"cd {tmp_path}") == os.path.normpath(str(tmp_path))
+    assert resolve_cd_hoist(f'cd "{tmp_path}"') == os.path.normpath(str(tmp_path))
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls -la",                 # not a cd
+    "cd /no/such/dir_doit_zz",  # target does not exist
+    "cd -",                   # OLDPWD - not hoisted
+    "cd ~ && ls",             # compound -> stays sandboxed
+    "cd x; rm y",             # compound
+    "echo $(cd /tmp)",        # substitution
+    "cd /tmp | cat",          # piped
+])
+def test_resolve_cd_hoist_bails(cmd):
+    from llm_communicator.tools import resolve_cd_hoist
+    assert resolve_cd_hoist(cmd) is None
+
+
+def test_hoist_cd_writes_sentinel_file(tmp_path, monkeypatch):
+    cdfile = tmp_path / "cdfile"
+    monkeypatch.setenv("DOIT_CD_FILE", str(cdfile))
+    agent = BashToolAgent(api_key="fake-key")
+    out = agent._hoist_cd("/home/u/proj")
+    assert cdfile.read_text() == "/home/u/proj"
+    assert "/home/u/proj" in out
+
+
+def test_hoist_cd_without_integration_does_not_crash(monkeypatch):
+    monkeypatch.delenv("DOIT_CD_FILE", raising=False)
+    agent = BashToolAgent(api_key="fake-key")
+    out = agent._hoist_cd("/home/u/proj")  # no shell function active
+    assert "/home/u/proj" in out
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_run_single_cd_is_hoisted_not_executed(mock_execute_bash, mock_completion, tmp_path, monkeypatch):
+    """A plain `cd` is hoisted to the parent shell (written to DOIT_CD_FILE), NOT run in the
+    subprocess, the safety filter is skipped, and the turn is still recorded in history."""
+    from llm_communicator import history_manager
+    cdfile = tmp_path / "cdfile"
+    monkeypatch.setenv("DOIT_CD_FILE", str(cdfile))
+
+    tool_call = MockToolCall("c1", "execute_bash_command", {"command": f"cd {tmp_path}", "explanation": "move"})
+    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call]))]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input") as mock_input:
+        agent.run_single("go to the project folder")
+        mock_input.assert_not_called()
+
+    assert cdfile.read_text() == os.path.normpath(str(tmp_path))
+    mock_execute_bash.assert_not_called()
+    assert mock_completion.call_count == 1   # generation only; no filter call for a cd
+    md = history_manager.get_history_metadata()
+    assert md[-1]["command"] == f"cd {tmp_path}"
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_history_preserved_normal_command_still_sandboxed(mock_execute_bash, mock_completion):
+    """KEY REGRESSION: a normal output-producing command still runs in the subprocess via the new
+    dispatch and its output is captured into history exactly as before."""
+    from llm_communicator import history_manager
+    tool_call = MockToolCall("c2", "execute_bash_command", {"command": "ls -la", "explanation": "list"})
+    msg_filter = MockMessage(content="DECISION: NO")
+    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call])), MockResponse(msg_filter)]
+    mock_execute_bash.return_value = "file1\nfile2"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("list the files")
+
+    mock_execute_bash.assert_called_once_with("ls -la")
+    full = history_manager.get_full_turns([1])
+    assert full[0]["output"] == "file1\nfile2"
+
+
+# =====================================================================
+# SECTION: session-state family hoist (export/alias/set/... except source)
+# =====================================================================
+
+@pytest.mark.parametrize("cmd", [
+    "export FOO=bar",
+    "export PATH=$PATH:/opt/bin",   # parameter expansion is allowed (hoisted as a command)
+    "alias g=git",
+    "set -o vi",
+    "shopt -s globstar",
+    "unset FOO",
+    "pushd /tmp",
+    "popd",
+])
+def test_resolve_session_state_hoist_matches(cmd):
+    from llm_communicator.tools import resolve_session_state_hoist
+    assert resolve_session_state_hoist(cmd) == cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls -la",                       # not a session-state builtin
+    "cd /tmp",                      # cd is handled separately, not here
+    "source ~/.bashrc",            # source is never hoisted
+    "export FOO=$(rm -rf ~)",       # command substitution -> refused
+    "export A=1 && export B=2",     # chaining -> refused
+    "alias x='ls; pwd'",            # metacharacter in value -> refused
+    "export FOO=bar | cat",         # piping -> refused
+])
+def test_resolve_session_state_hoist_bails(cmd):
+    from llm_communicator.tools import resolve_session_state_hoist
+    assert resolve_session_state_hoist(cmd) is None
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_run_single_export_is_hoisted_not_executed(mock_execute_bash, mock_completion, tmp_path, monkeypatch):
+    """An `export` is hoisted to the parent shell (written to DOIT_SHELL_FILE), not run in the
+    subprocess, and the turn is still recorded in history."""
+    from llm_communicator import history_manager
+    shfile = tmp_path / "shfile"
+    monkeypatch.setenv("DOIT_SHELL_FILE", str(shfile))
+
+    tool_call = MockToolCall("e1", "execute_bash_command", {"command": "export EDITOR=vim", "explanation": "set editor"})
+    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call]))]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input") as mock_input:
+        agent.run_single("set my editor to vim")
+        mock_input.assert_not_called()
+
+    assert shfile.read_text() == "export EDITOR=vim"
+    mock_execute_bash.assert_not_called()
+    assert mock_completion.call_count == 1   # no filter call for a hoisted builtin
+    md = history_manager.get_history_metadata()
+    assert md[-1]["command"] == "export EDITOR=vim"
+
+
+# =====================================================================
+# SECTION: first-run shell-integration bootstrap
+# =====================================================================
+
+def _si_setup(monkeypatch, tmp_path, shell="/bin/bash", interactive=True, active=False, rc_exists=True):
+    from doit_module import shell_integration
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", shell)
+    if active:
+        monkeypatch.setenv("DOIT_CD_FILE", str(tmp_path / "cd"))
+    else:
+        monkeypatch.delenv("DOIT_CD_FILE", raising=False)
+    monkeypatch.setattr(shell_integration, "_interactive", lambda: interactive)
+    rc = tmp_path / ".bashrc"
+    if rc_exists:
+        rc.write_text("# existing rc\n")
+    return shell_integration, rc
+
+
+def test_bootstrap_installs_on_accept(monkeypatch, tmp_path):
+    si, rc = _si_setup(monkeypatch, tmp_path)
+    si.ensure_shell_integration(input_fn=lambda _p: "y")
+    assert "doit-init.sh" in rc.read_text()
+
+
+def test_bootstrap_accepts_on_empty_enter(monkeypatch, tmp_path):
+    si, rc = _si_setup(monkeypatch, tmp_path)
+    si.ensure_shell_integration(input_fn=lambda _p: "")   # Enter -> default yes
+    assert "doit-init.sh" in rc.read_text()
+
+
+def test_bootstrap_declined_writes_nothing(monkeypatch, tmp_path):
+    si, rc = _si_setup(monkeypatch, tmp_path)
+    si.ensure_shell_integration(input_fn=lambda _p: "n")
+    assert "doit-init.sh" not in rc.read_text()
+
+
+def test_bootstrap_noop_when_active(monkeypatch, tmp_path):
+    si, rc = _si_setup(monkeypatch, tmp_path, active=True)
+    called = {"v": False}
+    def _inp(_p):
+        called["v"] = True
+        return "y"
+    si.ensure_shell_integration(input_fn=_inp)
+    assert called["v"] is False           # never prompts when already integrated
+    assert "doit-init.sh" not in rc.read_text()
+
+
+def test_bootstrap_noop_when_non_interactive(monkeypatch, tmp_path):
+    si, rc = _si_setup(monkeypatch, tmp_path, interactive=False)
+    called = {"v": False}
+    si.ensure_shell_integration(input_fn=lambda _p: called.__setitem__("v", True) or "y")
+    assert called["v"] is False
+    assert "doit-init.sh" not in rc.read_text()
+
+
+def test_bootstrap_does_not_reask_when_already_present(monkeypatch, tmp_path):
+    si, rc = _si_setup(monkeypatch, tmp_path)
+    init = si._init_script_path()
+    rc.write_text(f'source "{init}"\n')   # already installed
+    called = {"v": False}
+    si.ensure_shell_integration(input_fn=lambda _p: called.__setitem__("v", True) or "y")
+    assert called["v"] is False           # accepted previously -> no re-prompt
+
+
+def test_bootstrap_unsupported_shell_is_skipped(monkeypatch, tmp_path):
+    si, rc = _si_setup(monkeypatch, tmp_path, shell="/usr/bin/fish")
+    called = {"v": False}
+    si.ensure_shell_integration(input_fn=lambda _p: called.__setitem__("v", True) or "y")
+    assert called["v"] is False
+    assert "doit-init.sh" not in rc.read_text()
+
+
+def test_bootstrap_picks_zshrc_for_zsh(monkeypatch, tmp_path):
+    si, _ = _si_setup(monkeypatch, tmp_path, shell="/usr/bin/zsh")
+    (tmp_path / ".zshrc").write_text("# zsh rc\n")
+    si.ensure_shell_integration(input_fn=lambda _p: "y")
+    assert "doit-init.sh" in (tmp_path / ".zshrc").read_text()

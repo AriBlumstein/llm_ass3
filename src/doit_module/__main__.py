@@ -4,6 +4,7 @@ import argparse
 import subprocess
 import sys
 from llm_communicator.llm_bash import BashToolAgent, BashSafetyViolationError
+from doit_module.shell_integration import ensure_shell_integration
 
 
 def main():
@@ -37,6 +38,11 @@ def main():
         else:
             parser.print_help()
             sys.exit(1)
+
+    # On an interactive run that isn't already going through the doit shell function, offer to
+    # install the integration that makes cd/export persist. Keeps asking until accepted; no-op when
+    # already integrated or non-interactive.
+    ensure_shell_integration()
 
     try:
         llm = BashToolAgent(force_new=args.new)

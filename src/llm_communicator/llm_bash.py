@@ -19,6 +19,8 @@ from llm_communicator.tools import (
     is_howto_question,
     answer_howto_question,
     is_execute_suggestion_request,
+    resolve_cd_hoist,
+    resolve_session_state_hoist,
     parse_json_response,
     is_openai_model,
     NO_ANSWER_SENTINEL,
@@ -273,6 +275,64 @@ class BashToolAgent:
             return False, ""
 
         return True, explanation
+
+    def _hoist_cd(self, abspath: str) -> str:
+        """
+        Hoist a `cd` to the PARENT shell. A subprocess can never change the user's cwd, so when the
+        doit shell function is active it has set DOIT_CD_FILE; we write the resolved directory there
+        and the function runs `cd` in the user's shell. Without that integration we can't move the
+        shell, so we print the command for the user to run. `cd` produces no stdout, so nothing the
+        agent might later reference is lost by not running it in the subprocess. Returns the marker
+        stored as this turn's output, so the turn is still recorded in history.
+        """
+        cd_file = os.environ.get("DOIT_CD_FILE")
+        if cd_file:
+            try:
+                with open(cd_file, "w", encoding="utf-8") as f:
+                    f.write(abspath)
+                print(f"[doit] changed directory to {abspath}")
+            except Exception as e:
+                print(f"[doit] could not record directory change: {e}")
+        else:
+            print(f"[doit] shell integration is not active; to move there run:\n  cd {abspath}")
+        return f"[changed directory to {abspath}]"
+
+    def _hoist_shell(self, command: str) -> str:
+        """
+        Hoist a session-state builtin (export/alias/set/unset/shopt/pushd/popd) to the PARENT shell
+        via DOIT_SHELL_FILE; the doit shell function runs it there so it persists. The command was
+        screened by resolve_session_state_hoist (no substitution/chaining/redirection), so running
+        it in the live shell can only mutate shell state, not execute an arbitrary program. These
+        builtins produce no stdout the agent would reference, so history/capture are unaffected.
+        """
+        shell_file = os.environ.get("DOIT_SHELL_FILE")
+        if shell_file:
+            try:
+                with open(shell_file, "w", encoding="utf-8") as f:
+                    f.write(command)
+                print(f"[doit] applied to your shell: {command}")
+            except Exception as e:
+                print(f"[doit] could not apply to shell: {e}")
+        else:
+            print(f"[doit] shell integration is not active; to apply this run:\n  {command}")
+        return f"[applied to shell: {command}]"
+
+    def _dispatch_command(self, command: str) -> str:
+        """
+        Run a generated command. A plain `cd` is value-hoisted to the parent shell (see _hoist_cd);
+        a single session-state builtin (export/alias/set/unset/shopt/pushd/popd) is command-hoisted
+        (see _hoist_shell); everything else goes through the sandboxed subprocess with the safety
+        filter and confirmation (see _execute_with_confirmation).
+        """
+        cd_target = resolve_cd_hoist(command)
+        if cd_target is not None:
+            _debug("CD hoist:", cd_target)
+            return self._hoist_cd(cd_target)
+        shell_cmd = resolve_session_state_hoist(command)
+        if shell_cmd is not None:
+            _debug("SHELL-STATE hoist:", shell_cmd)
+            return self._hoist_shell(shell_cmd)
+        return self._execute_with_confirmation(command)
 
     def _execute_with_confirmation(self, command: str) -> str:
         """
@@ -579,17 +639,7 @@ class BashToolAgent:
                             print(f"[TOOL REQUESTED] Command: {command_input.command}")
                             print(f"[TOOL REQUESTED] Explanation: {command_input.explanation}")
 
-                            modifies, filter_explanation = self._filter_bash(command_input.command)
-                            should_execute = True
-                            if modifies:
-                                print(f"This command will modify your file system: {filter_explanation}")
-                                user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
-                                if user_choice not in ('y', 'yes'):
-                                    should_execute = False
-                                    execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
-
-                            if should_execute:
-                                execution_result = execute_bash(command_input.command)
+                            execution_result = self._dispatch_command(command_input.command)
                         except json.JSONDecodeError:
                             execution_result = "[Error: Generated JSON arguments failed structure validation rules]"
                         except BashSafetyViolationError as safety_err:
@@ -684,17 +734,7 @@ class BashToolAgent:
                 print(f"[TEXT PARSED] Explanation: {explanation}")
 
                 try:
-                    modifies, filter_explanation = self._filter_bash(command)
-                    should_execute = True
-                    if modifies:
-                        print(f"This command will modify your file system: {filter_explanation}")
-                        user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
-                        if user_choice not in ('y', 'yes'):
-                            should_execute = False
-                            execution_result = "[Cancelled: User declined to execute command that modifies the file system]"
-
-                    if should_execute:
-                        execution_result = execute_bash(command)
+                    execution_result = self._dispatch_command(command)
                 except Exception as e:
                     execution_result = f"[Error: Fallback JSON parsing/execution failed: {str(e)}]"
 

@@ -347,6 +347,68 @@ def is_execute_suggestion_request(instruction: str) -> bool:
     return any(re.search(p, text, re.IGNORECASE) for p in EXECUTE_SUGGESTION_PATTERNS)
 
 
+def resolve_cd_hoist(command: str) -> Optional[str]:
+    """
+    If `command` is a plain `cd <target>` - a SINGLE simple command, no chaining/piping/redirection
+    /substitution - whose target resolves to an existing directory, return that absolute directory
+    so it can be hoisted to the parent shell (a subprocess can't change the user's cwd). Otherwise
+    return None and the command runs normally in the sandboxed subprocess.
+
+    Bails (returns None) on compound commands, `cd -`, and non-existent targets, so we never hoist
+    - and thus never skip the sandbox for - anything but a clean directory change.
+    """
+    if not command:
+        return None
+    cmd = command.strip()
+    # Only a single, simple cd is hoistable. Anything chained/piped/redirected/substituted must run
+    # in the subprocess (so its non-cd parts stay sandboxed) - bail.
+    if any(tok in cmd for tok in (";", "&&", "||", "|", "\n", "`", "$(", ">", "<", "&")):
+        return None
+    m = re.match(r"^cd(?:\s+(.*))?$", cmd)
+    if not m:
+        return None
+    target = (m.group(1) or "~").strip()
+    if len(target) >= 2 and target[0] == target[-1] and target[0] in ("'", '"'):
+        target = target[1:-1]
+    if not target or target == "-":
+        return None
+    expanded = os.path.expanduser(os.path.expandvars(target))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(os.getcwd(), expanded)
+    expanded = os.path.normpath(expanded)
+    return expanded if os.path.isdir(expanded) else None
+
+
+# Shell builtins that mutate session state and so cannot work from a subprocess. `cd` is handled
+# separately (resolve_cd_hoist, value-hoisted as a path); `source` is deliberately NOT here (it
+# runs a file's code in the live shell - resolve-and-explain only).
+SESSION_STATE_BUILTINS = ("export", "alias", "unalias", "set", "shopt", "unset", "pushd", "popd")
+
+
+def resolve_session_state_hoist(command: str) -> Optional[str]:
+    """
+    If `command` is a SINGLE session-state builtin invocation (export/alias/set/unset/shopt/pushd/
+    popd) with no command substitution, chaining, piping, redirection, or backgrounding, return the
+    command to run in the parent shell. Otherwise None (it stays in the sandboxed subprocess).
+
+    Unlike `cd`, these are hoisted as the COMMAND (not a value) because they legitimately need
+    parameter expansion - e.g. `export PATH=$PATH:/x` must expand `$PATH`. The screening below is
+    what makes running it in the live shell safe: with no command substitution (`$(...)`,
+    backticks) and no chaining to a non-builtin, the command can ONLY mutate shell state
+    (vars/aliases/options/dir stack) - it cannot execute an arbitrary program. (Limitation: an
+    export/alias whose VALUE contains shell metacharacters is conservatively NOT hoisted.)
+    """
+    if not command:
+        return None
+    cmd = command.strip()
+    if any(tok in cmd for tok in ("$(", "`", ";", "&&", "||", "|", ">", "<", "&", "\n")):
+        return None
+    parts = cmd.split(None, 1)
+    if parts and parts[0] in SESSION_STATE_BUILTINS:
+        return cmd
+    return None
+
+
 def answer_howto_question(instruction: str) -> tuple:
     """
     Answer a how-to question via a focused, single-purpose LLM call (model/endpoint from
