@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 import litellm
 
-from fixtures import CLARIFY_AUTHOR_PROMPT, ANSWER_HOWTO_PROMPT, CTX_NUM
+from fixtures import CLARIFY_AUTHOR_PROMPT, ANSWER_HOWTO_PROMPT, MEMORY_MANAGER_PROMPT, CTX_NUM
 from doit_module.config_loader import load_config
 
 
@@ -181,7 +181,14 @@ def execute_bash(command: str, verbose: bool = True) -> str:
         if result.stderr:
             output += f"--- STDERR ---\n{result.stderr}\n"
         if result.returncode is not None:
-            output += f"--- RETURN CODE ---\n{result.returncode}\n"
+            # Label the exit status explicitly: 0 means SUCCESS. A bare "0" was being misread by the
+            # model as a failure (e.g. refusing to delete a file a prior `touch` actually created).
+            status = "SUCCESS" if result.returncode == 0 else "FAILED"
+            output += f"--- RETURN CODE ---\n{result.returncode} ({status})\n"
+
+        # A command that exits 0 with no stdout/stderr still succeeded - say so clearly.
+        if result.returncode == 0 and not result.stdout and not result.stderr:
+            output = "[SUCCESS: command completed (exit code 0), produced no output]\n" + output
 
         if not output:
             output = "[Success: Command executed with no returning output channels]"
@@ -449,6 +456,65 @@ def ask_user_clarification(instruction: str) -> str:
     """
     question, options = _author_clarification(instruction)
     return ask_clarification(question, options)
+
+
+# Openers that suggest the instruction states a durable fact/preference worth REMEMBERING. A cheap
+# Python gate (like the how-to / context-indicator heuristics) so the memory sub-call is skipped on
+# ordinary commands instead of running every turn.
+MEMORY_CANDIDATE_PATTERNS = [
+    r"\bremember\b", r"\bkeep in mind\b", r"\bdon'?t forget\b", r"\bnote that\b",
+    r"\bfrom now on\b", r"\bgoing forward\b", r"\bfor (the )?future\b",
+    r"\balways\b", r"\bnever\b",
+    r"\bi prefer\b", r"\bi like\b", r"\bi (would |'d )?want you to\b",
+    r"\bthis is my\b", r"\bthat'?s my\b",
+    r"\bmy [\w-]+ (folder|directory|dir|project|repo|workspace)\b",
+    r"\bi changed my mind\b", r"\bask me (each|every) time\b",
+]
+
+
+def is_memory_candidate(instruction: str) -> bool:
+    """
+    True when the instruction looks like it states something durable to remember about the user.
+    Deterministic gate so the memory sub-call doesn't run on every ordinary command.
+    """
+    text = instruction or ""
+    return any(re.search(p, text, re.IGNORECASE) for p in MEMORY_CANDIDATE_PATTERNS)
+
+
+def extract_memories(instruction: str, existing: List[Dict[str, Any]], executed_command: str = "") -> List[Dict[str, Any]]:
+    """
+    Focused memory-manager sub-call (model/endpoint from doit.cfg). Given the instruction, the
+    current memories, and (optionally) the command just executed, returns a list of operations
+    (add/update/delete) to apply to the store. Empty list on any failure. Built like
+    `answer_howto_question` / `_author_clarification` - one job, no other machinery.
+    """
+    model_name, api_base, tool_calling = load_config()
+    existing_block = "\n".join(
+        f'- id {r.get("id")}: {r.get("content")}' for r in (existing or [])
+    ) or "(none)"
+    user_content = (
+        f'User instruction: "{instruction}"\n'
+        f'Command just executed: "{executed_command}"\n\n'
+        f"Current memories:\n{existing_block}"
+    )
+    completion_params = {
+        "model": model_name,
+        "api_base": api_base,
+        "messages": [
+            {"role": "system", "content": MEMORY_MANAGER_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    if not tool_calling and not is_openai_model(model_name):
+        completion_params["num_ctx"] = CTX_NUM
+
+    try:
+        response = litellm.completion(**completion_params)
+        parsed = parse_json_response(response.choices[0].message.content or "")
+        ops = parsed.get("operations", [])
+        return ops if isinstance(ops, list) else []
+    except Exception:
+        return []
 
 
 # Defining the tools using OpenAI/LiteLLM's standard format.

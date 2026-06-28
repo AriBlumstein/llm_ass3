@@ -23,11 +23,17 @@ def find_project_root() -> Path:
 def get_history_file_path() -> Path:
     """
     Get the path to the history file for the current shell session (isolated by PPID).
-    Stored in a hidden directory in the resolved project root directory.
+
+    Anchored to the INSTALL location (this module -> repo root), NOT the cwd. `cd` now persists, so
+    the working directory changes between invocations; a cwd-relative path (walking up from the cwd)
+    would scatter a single session's turns across multiple `.doit/` directories - breaking
+    reference resolution and making `-n` clear the wrong file. Install-relative keeps one session
+    (one PPID) in one file regardless of where doit is run from, co-located with memory under the
+    repo's `.doit/`.
     """
     ppid = os.environ.get("DOIT_PPID") or str(os.getppid())
-    project_root = find_project_root()
-    history_dir = project_root / ".doit"
+    repo_root = Path(__file__).resolve().parents[2]
+    history_dir = repo_root / ".doit"
     history_dir.mkdir(parents=True, exist_ok=True)
     return history_dir / f"history_{ppid}.jsonl"
 

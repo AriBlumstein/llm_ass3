@@ -146,6 +146,12 @@ FEWSHOT_FALLBACK = [
     # Rule 1: a direct request creates/runs a command.
     {"role": "user", "content": "create a file called notes.txt"},
     {"role": "assistant", "content": '{"executable": true, "command": "touch notes.txt", "explanation": "create an empty file notes.txt", "rule_triggered": 1, "response_text": ""}'},
+    # Rule 7 (the case that mis-fired): a command that exits 0 SUCCEEDED. A follow-up to delete the
+    # file it created must generate `rm` - do NOT refuse it as a "failed previous step". `0` = success.
+    {"role": "user", "content": "make a file called scratch.txt"},
+    {"role": "assistant", "content": '{"executable": true, "command": "touch scratch.txt", "explanation": "create scratch.txt", "rule_triggered": 1, "response_text": ""}'},
+    {"role": "user", "content": "Command execution output:\n[SUCCESS: command completed (exit code 0), produced no output]\n--- RETURN CODE ---\n0 (SUCCESS)\n\ndelete the file we just created"},
+    {"role": "assistant", "content": '{"executable": true, "command": "rm scratch.txt", "explanation": "delete the file we just created", "rule_triggered": 1, "response_text": ""}'},
     # Rule 1: a DIRECT "find/list ..." request is a command to execute (NOT a how-to, NOT ambiguous).
     {"role": "user", "content": "find files bigger than 100MB in this folder"},
     {"role": "assistant", "content": '{"executable": true, "command": "find . -type f -size +100M", "explanation": "find large files under the current folder", "rule_triggered": 1, "response_text": ""}'},

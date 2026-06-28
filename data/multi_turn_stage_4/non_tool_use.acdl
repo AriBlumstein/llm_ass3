@@ -1,0 +1,153 @@
+// Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Multi-Turn Stage 4 - persistent memory + shell-state persistence)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = false). The model emits a raw fallback-JSON
+// block; execution output and clarification answers are fed back as USER messages.
+//
+// Stage 4 layers two features on top of Stage 3:
+//   (a) PERSISTENT MEMORY - durable facts/preferences about the user, stored globally in the repo's
+//       `.doit/memories.json` (resolved from the install path, so it is the same store regardless of
+//       cwd/terminal/session). It appears in TWO places: injected into the main agent's system prompt
+//       every turn, and a new MemoryManager sub-call decides what to store/update/delete after the turn.
+//   (b) SHELL-STATE PERSISTENCE - a generated `cd` (or a session-state builtin: export/alias/set/
+//       unset/shopt/pushd/popd) is hoisted to the PARENT shell so it persists. The hoist is
+//       deterministic (no LLM call) and adds no context block; the command is still VETTED by
+//       BashFilter first, and only its subprocess execution is replaced by the parent-shell hoist.
+//
+// As in Stage 3, two DETERMINISTIC Python checks run BEFORE the main pipeline and can short-circuit:
+//   - how-to question (is_howto_question)            -> HowtoAnswerSubcall (context 0), then DONE.
+//   - "execute that" (is_execute_suggestion_request) AND a prior suggested_command exists
+//                                                     -> run that command through BashFilter, then DONE.
+// Otherwise the pipeline runs:
+//   1) HistoryReferenceResolver - picks relevant prior turns                                  (unchanged vs Stage 3)
+//   2) DoitNonToolUseAgent      - generates a command / answers / clarifies; now memory-aware  (CHANGED)
+//   3) ClarificationAuthor      - authors the clarifying question                             (unchanged)
+//   4) BashFilter               - judges whether a command modifies the filesystem; vets hoisted commands too  (CHANGED)
+//   5) MemoryManager            - stores/updates/deletes durable memories after the turn      (NEW)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Clarification is bounded
+// to MAX_CLARIFICATION_ROUNDS (= 2). Convention: any index < @T refers to a prior turn.
+
+
+// 0. How-to Answer Sub-call (answer_howto_question) - unchanged from Stage 3.
+//    Runs (instead of the pipeline) when is_howto_question(env.user_input[@T]) matches. A focused call
+//    with none of the multi-rule/clarification machinery; returns (explanation, suggested_command),
+//    stored so a later "execute that" can run it. NOT memory-aware - memory is injected only into the
+//    main agent below.
+HowtoAnswerSubcall[@T]: {
+    S: {
+        sys.answer_howto_prompt
+    }
+
+    U: env.user_input[@T]                       // only the instruction; returns explanation + suggested_command
+}
+
+
+// 1. History Reference Resolver (_analyze_references) - unchanged from Stage 3.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]   // newest-first; turns with a command OR suggested_command; fields: [id, prompt, command, suggested_command]
+    }
+}
+
+
+// 2. Doit Main Agent (DoitNonToolUseAgent) - CHANGED vs Stage 3.
+//    Same structure as Stage 3, but the system prompt now also carries the PERSISTENT MEMORY block,
+//    loaded fresh from the global store each run. It is in the SYSTEM message only, BEFORE the few-shot
+//    and replayed history, so it informs command generation AND the clarification decision without
+//    disturbing history reference-resolution/replay.
+DoitNonToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt
+        sys.fallback_system_instruction
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]                // NEW: "KNOWN FACTS ABOUT THE USER ..." rendered from memory; present only when memories exist; newest overrides older on conflict
+        }
+    }
+
+    // Fixed in-context few-shot (FEWSHOT_FALLBACK) - the Rule 1/8/9 discriminator plus a
+    // create -> success -> delete sequence. Each demo is a user/assistant pair.
+    ForEach(@d: sys.fewshot_fallback) {
+        U: sys.fewshot_fallback[@d].instruction
+        A: sys.fewshot_fallback[@d].response    // fallback JSON: command | needs_clarification | rule-9 answer with suggested_command
+    }
+
+    // Replayed relevant history (resolved + transitively chained ids), ascending - unchanged from Stage 3.
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids) {
+        U: sys.pid.turn[@t].prompt
+        If(sys.pid.turn[@t].command != "") {
+            A: sys.pid.tool_call[@t]            // SERIALIZED: assistant fallback-JSON, executable=true, command, explanation="execute <command>", rule_triggered=1
+            T: sys.pid.turn[@t].output          // SERIALIZED: USER message "Command execution output: <output>"; truncated to 2000 chars
+        } Else {
+            If(sys.pid.turn[@t].suggested_command != "") {
+                A: sys.pid.answer_replay[@t]    // SERIALIZED: assistant fallback-JSON, executable=false, suggested_command, rule_triggered=9, response_text=<stored output>
+            } Else {
+                A: sys.pid.turn[@t].output      // turn produced neither: plain assistant message
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    // Bounded clarification loop - unchanged from Stage 3.
+    ForEach(i: pid.clarification_steps[@T]) {   // i = step within turn @T; bounded by MAX_CLARIFICATION_ROUNDS (2)
+        If(resp.pid.doit_non_tool_use_agent[@T.i].needs_clarification) {
+            A: resp.pid.doit_non_tool_use_agent[@T.i]   // fallback JSON: needs_clarification=true, executable=false, command="", rule_triggered=8
+            T: env.user_clarification_answer[@T.i]      // SERIALIZED as a USER message via _clarification_followup; or a no-answer sentinel
+        }
+    }
+    // Terminal fallback-JSON: executable=true (a command -> BashFilter vets it; then it is hoisted to
+    // the parent shell if cd/session-state builtin, else run in the subprocess); rule_triggered=9
+    // (answer); or a rejection/chat.
+}
+
+
+// 3. Clarification Author (_author_clarification) - unchanged from Stage 3.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]                       // only the instruction; returns a question plus optional options
+}
+
+
+// 4. Bash Filter (_filter_bash) - CHANGED vs Stage 3 (now vets HOISTED commands too).
+//    Reached for EVERY main-pipeline command (whether it will run in the subprocess or be hoisted to
+//    the parent shell) and from the "execute that" short-circuit. One user message: the fixed question
+//    concatenated with the command. If it judges the command modifies the filesystem, the user is
+//    asked [y/N]; only after this gate does a cd/session-state command get hoisted, and a declined
+//    command is neither run nor hoisted.
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction             // "Does the following command modify the file system?"
+        resp.pid.doit_non_tool_use_agent[@T].command   // any pipeline command (hoisted or not); OR, on "execute that", sys.pid.latest_suggested_command[@T]
+    }
+}
+
+
+// 5. Memory Manager (extract_memories) - NEW in Stage 4.
+//    After the turn is handled, IF the instruction looks like a durable fact/preference (a cheap
+//    is_memory_candidate keyword gate), a focused single-purpose call decides what to store/update/
+//    delete in the global memory store. It returns a list of operations (add/update/delete-by-id),
+//    applied to <repo>/.doit/memories.json. Independent of the action, so one instruction can both act
+//    and be remembered. Skipped (no LLM context) when the gate does not match.
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_non_tool_use_agent[@T].command   // the command just executed this turn (may be ""), to resolve "this folder" -> a path
+        sys.memories[@T]                                // the current stored memories, each with its id (so the call can UPDATE/DELETE, not just ADD)
+    }
+}

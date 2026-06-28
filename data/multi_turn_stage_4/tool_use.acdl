@@ -1,0 +1,139 @@
+// Doit Agent Context: Tool Use Scenario (Multi-Turn Stage 4 - persistent memory + shell-state persistence)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = true).
+// Stage 4 layers two features on top of Stage 3:
+//   (a) PERSISTENT MEMORY - durable facts/preferences about the user, stored globally in the repo's
+//       `.doit/memories.json` (resolved from the install path, so it is the same store regardless of
+//       cwd/terminal/session). Memory appears in TWO places: it is injected into the main agent's
+//       system prompt every turn, and a new MemoryManager sub-call decides what to store/update/
+//       delete after the turn.
+//   (b) SHELL-STATE PERSISTENCE - a generated `cd` (or a session-state builtin: export/alias/set/
+//       unset/shopt/pushd/popd) is hoisted to the PARENT shell so it persists. The hoist is
+//       deterministic (no LLM call) and adds no context block; the command is still VETTED by
+//       BashFilter first, and only its subprocess execution is replaced by the parent-shell hoist.
+//
+// Per user turn @T the LLM contexts are, in order:
+//   1) HistoryReferenceResolver - picks relevant prior turns                                  (unchanged vs Stage 3)
+//   2) DoitToolUseAgent         - generates a command / answers / clarifies; now memory-aware  (CHANGED)
+//   3) ClarificationAuthor      - authors the clarifying question                             (unchanged)
+//   4) BashFilter               - judges whether a command modifies the filesystem; vets hoisted commands too  (CHANGED)
+//   5) MemoryManager            - stores/updates/deletes durable memories after the turn      (NEW)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Clarification is bounded
+// to MAX_CLARIFICATION_ROUNDS (= 2). Convention: any index < @T refers to a prior turn.
+
+
+// 1. History Reference Resolver (_analyze_references) - unchanged from Stage 3.
+//    One user message: the new instruction plus prior history as metadata only (id, prompt, command,
+//    suggested_command - NO output), last 20 turns, newest-first; a turn is eligible if it has a
+//    command OR a suggested_command. Skipped (no LLM context) when there is no contextual indicator.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]   // newest-first; turns with a command OR suggested_command; fields: [id, prompt, command, suggested_command]
+    }
+}
+
+
+// 2. Doit Main Agent (DoitToolUseAgent) - CHANGED vs Stage 3.
+//    Same structure as Stage 3, but the system prompt now also carries the PERSISTENT MEMORY block,
+//    loaded fresh from the global store each run. It is in the SYSTEM message only, BEFORE the few-shot
+//    and replayed history, so it informs command generation AND the clarification decision (e.g. "go to
+//    my llm class project" resolves to a remembered path) without disturbing history.
+DoitToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]                // NEW: "KNOWN FACTS ABOUT THE USER ..." rendered from memory; present only when memories exist; newest overrides older on conflict
+        }
+        sys.tools_definition                    // execute_bash_command, answer_question, ask_user_clarification
+    }
+
+    // Fixed in-context few-shot (FEWSHOT_TOOLCALL) - unchanged. Each demo is a triple.
+    ForEach(@d: sys.fewshot_toolcall) {
+        U: sys.fewshot_toolcall[@d].instruction
+        A: sys.fewshot_toolcall[@d].tool_call   // execute_bash_command OR ask_user_clarification call
+        T: sys.fewshot_toolcall[@d].result      // command output, or the clarification answer
+    }
+
+    // Replayed relevant history (resolved + transitively chained ids), ascending - unchanged from Stage 3.
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids) {
+        U: sys.pid.turn[@t].prompt
+        If(sys.pid.turn[@t].command != "") {
+            A: sys.pid.tool_call[@t]            // execute_bash_command tool call
+            T: sys.pid.turn[@t].output          // tool result; truncated to 2000 chars
+        } Else {
+            If(sys.pid.turn[@t].suggested_command != "") {
+                A: sys.pid.answer_call[@t]      // answer_question call (explanation = stored output, suggested_command)
+                T: ANSWER_DELIVERED_NOTICE      // fixed tool result: suggestion delivered, NOT executed
+            } Else {
+                A: sys.pid.turn[@t].output      // turn produced neither: plain assistant message
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    // Bounded clarification loop - unchanged from Stage 3.
+    ForEach(i: pid.clarification_steps[@T]) {   // i = step within turn @T; bounded by MAX_CLARIFICATION_ROUNDS (2)
+        If(resp.pid.doit_tool_use_agent[@T.i].asks_clarification) {
+            A: resp.pid.doit_tool_use_agent[@T.i].ask_user_clarification_call
+            T: env.user_clarification_answer[@T.i]
+        }
+    }
+    // Terminal action: execute_bash_command (-> BashFilter vets it; then it is hoisted to the parent
+    // shell if it is a cd/session-state builtin, else run in the subprocess); answer_question
+    // (terminal, stored with its suggested_command, nothing executed); or plain text.
+}
+
+
+// 3. Clarification Author (_author_clarification) - unchanged from Stage 3.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]                       // only the instruction; returns a question plus optional options
+}
+
+
+// 4. Bash Filter (_filter_bash) - CHANGED vs Stage 3 (now vets HOISTED commands too).
+//    Invoked whenever the agent emits an execute_bash_command call - for EVERY command, whether it
+//    will run in the subprocess or be hoisted to the parent shell. One user message: the fixed
+//    question concatenated with the command. If it judges the command modifies the filesystem, the
+//    user is asked [y/N]; only after this gate does a cd/session-state command get hoisted, and a
+//    declined command is neither run nor hoisted.
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction             // "Does the following command modify the file system?"
+        resp.pid.doit_tool_use_agent[@T].tool_call[0].command   // command arg of the final execute_bash_command call (hoisted or not)
+    }
+}
+
+
+// 5. Memory Manager (extract_memories) - NEW in Stage 4.
+//    After the turn is handled, IF the instruction looks like a durable fact/preference (a cheap
+//    is_memory_candidate keyword gate, like the resolver's indicator check), a focused single-purpose
+//    call decides what to store/update/delete in the global memory store. It returns a list of
+//    operations (add/update/delete-by-id), applied to <repo>/.doit/memories.json. Independent of the
+//    action above, so one instruction can both act and be remembered. Skipped (no LLM context) when
+//    the gate does not match.
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_tool_use_agent[@T].command   // the command just executed this turn (may be ""), to resolve "this folder" -> a path
+        sys.memories[@T]                            // the current stored memories, each with its id (so the call can UPDATE/DELETE, not just ADD)
+    }
+}

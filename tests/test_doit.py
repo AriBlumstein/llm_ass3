@@ -67,10 +67,14 @@ class MockResponse:
 
 @pytest.fixture(autouse=True)
 def isolate_history(tmp_path, monkeypatch):
-    """Automatically isolate all tests from the host's actual history file."""
-    from llm_communicator import history_manager
+    """Automatically isolate all tests from the host's actual history AND memory files."""
+    from llm_communicator import history_manager, memory_manager
     test_file = tmp_path / "test_history.jsonl"
     monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    # Memory is a GLOBAL store (~/.doit/memories.json) - isolate it so no test touches the real
+    # one, and every BashToolAgent constructed in tests sees an empty store unless it adds memories.
+    mem_file = tmp_path / "test_memories.json"
+    monkeypatch.setattr(memory_manager, "get_memory_file_path", lambda: mem_file)
 
 
 # =====================================================================
@@ -171,6 +175,19 @@ def test_dangerous_commands_violate_safety(banned_command):
 def test_safe_command_execution():
     output = execute_bash("echo 'safety check'", verbose=False)
     assert "safety check" in output
+
+
+def test_exit_code_zero_is_labelled_success():
+    """A successful command (exit 0) must be clearly marked SUCCESS so the model never reads
+    `0` as a failure (the touch-then-delete bug)."""
+    output = execute_bash("true", verbose=True)            # exits 0, no stdout/stderr
+    assert "SUCCESS" in output
+    assert "FAILED" not in output
+
+
+def test_nonzero_exit_code_is_labelled_failed():
+    output = execute_bash("sh -c 'exit 3'", verbose=True)  # exits 3
+    assert "3 (FAILED)" in output
 
 
 # =====================================================================
@@ -1402,26 +1419,48 @@ def test_hoist_cd_without_integration_does_not_crash(monkeypatch):
 @patch("llm_communicator.llm_bash.litellm.completion")
 @patch("llm_communicator.llm_bash.execute_bash")
 def test_run_single_cd_is_hoisted_not_executed(mock_execute_bash, mock_completion, tmp_path, monkeypatch):
-    """A plain `cd` is hoisted to the parent shell (written to DOIT_CD_FILE), NOT run in the
-    subprocess, the safety filter is skipped, and the turn is still recorded in history."""
+    """A plain `cd` is VETTED by the filter, then hoisted to the parent shell (DOIT_CD_FILE), NOT run
+    in the subprocess, and the turn is still recorded in history."""
     from llm_communicator import history_manager
     cdfile = tmp_path / "cdfile"
     monkeypatch.setenv("DOIT_CD_FILE", str(cdfile))
 
     tool_call = MockToolCall("c1", "execute_bash_command", {"command": f"cd {tmp_path}", "explanation": "move"})
-    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call]))]
+    msg_filter = MockMessage(content="DECISION: NO")   # filter now runs on the hoisted command too
+    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call])), MockResponse(msg_filter)]
 
     agent = BashToolAgent(api_key="fake-key")
     agent.tool_calling = True
     with patch("builtins.input") as mock_input:
         agent.run_single("go to the project folder")
-        mock_input.assert_not_called()
+        mock_input.assert_not_called()           # filter said NO -> no confirmation prompt
 
     assert cdfile.read_text() == os.path.normpath(str(tmp_path))
-    mock_execute_bash.assert_not_called()
-    assert mock_completion.call_count == 1   # generation only; no filter call for a cd
+    mock_execute_bash.assert_not_called()        # hoisted, never run in the subprocess
+    assert mock_completion.call_count == 2       # generation + filter
     md = history_manager.get_history_metadata()
     assert md[-1]["command"] == f"cd {tmp_path}"
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_hoisted_command_can_be_blocked_by_filter(mock_execute_bash, mock_completion, tmp_path, monkeypatch):
+    """The filter now vets hoisted commands: if it flags one and the user declines, it is NOT
+    hoisted (nothing written to the sentinel file)."""
+    cdfile = tmp_path / "cdfile"
+    monkeypatch.setenv("DOIT_CD_FILE", str(cdfile))
+
+    tool_call = MockToolCall("c9", "execute_bash_command", {"command": f"cd {tmp_path}", "explanation": "move"})
+    msg_filter = MockMessage(content="DECISION: YES")   # filter flags it as modifying
+    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call])), MockResponse(msg_filter)]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="n"):     # user declines
+        agent.run_single("go to the project folder")
+
+    assert not cdfile.exists()                           # NOT hoisted
+    mock_execute_bash.assert_not_called()
 
 
 @patch("llm_communicator.llm_bash.litellm.completion")
@@ -1487,7 +1526,8 @@ def test_run_single_export_is_hoisted_not_executed(mock_execute_bash, mock_compl
     monkeypatch.setenv("DOIT_SHELL_FILE", str(shfile))
 
     tool_call = MockToolCall("e1", "execute_bash_command", {"command": "export EDITOR=vim", "explanation": "set editor"})
-    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call]))]
+    msg_filter = MockMessage(content="DECISION: NO")   # filter now runs on the hoisted builtin too
+    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call])), MockResponse(msg_filter)]
 
     agent = BashToolAgent(api_key="fake-key")
     agent.tool_calling = True
@@ -1497,7 +1537,7 @@ def test_run_single_export_is_hoisted_not_executed(mock_execute_bash, mock_compl
 
     assert shfile.read_text() == "export EDITOR=vim"
     mock_execute_bash.assert_not_called()
-    assert mock_completion.call_count == 1   # no filter call for a hoisted builtin
+    assert mock_completion.call_count == 2   # generation + filter
     md = history_manager.get_history_metadata()
     assert md[-1]["command"] == "export EDITOR=vim"
 
@@ -1580,3 +1620,163 @@ def test_bootstrap_picks_zshrc_for_zsh(monkeypatch, tmp_path):
     (tmp_path / ".zshrc").write_text("# zsh rc\n")
     si.ensure_shell_integration(input_fn=lambda _p: "y")
     assert "doit-init.sh" in (tmp_path / ".zshrc").read_text()
+
+
+# =====================================================================
+# SECTION: Persistent user memory
+# =====================================================================
+
+def test_memory_store_crud():
+    from llm_communicator import memory_manager
+    assert memory_manager.load_memories() == []
+    a = memory_manager.add_memory("alpha")
+    b = memory_manager.add_memory("beta")
+    assert [m["content"] for m in memory_manager.load_memories()] == ["alpha", "beta"]
+    memory_manager.update_memory(a, "alpha-2")
+    assert memory_manager.load_memories()[0]["content"] == "alpha-2"
+    memory_manager.delete_memory(b)  # tombstone
+    assert [m["content"] for m in memory_manager.load_memories()] == ["alpha-2"]
+    assert memory_manager.add_memory("   ") == -1  # empty ignored
+
+
+def test_render_memories_block():
+    from llm_communicator import memory_manager
+    assert memory_manager.render_memories() == ""  # empty for new users
+    memory_manager.add_memory("~/x is the project folder")
+    block = memory_manager.render_memories()
+    assert "KNOWN FACTS ABOUT THE USER" in block
+    assert "~/x is the project folder" in block
+    assert "MOST RECENT" in block   # recency-precedence hint for conflicting memories
+
+
+def test_memory_supersession_via_operations():
+    """'I changed my mind' style: delete the old memory + add the new; new wins."""
+    from llm_communicator import memory_manager
+    id1 = memory_manager.add_memory("the user prefers sorting by modification time")
+    memory_manager.add_memory("~/x is the project")
+    memory_manager.apply_operations([
+        {"op": "delete", "id": id1},
+        {"op": "add", "content": "when sorting, always ask the user about the order"},
+    ])
+    active = [m["content"] for m in memory_manager.load_memories()]
+    assert "the user prefers sorting by modification time" not in active
+    assert "when sorting, always ask the user about the order" in active
+    assert "~/x is the project" in active
+
+
+@pytest.mark.parametrize("text", [
+    "remember that ~/x is my project folder",
+    "this is my LLM class project folder",
+    "I prefer sorting by modification date",
+    "I changed my mind about the sorting order, ask me each time",
+    "from now on always use long listing",
+    "keep in mind I work mostly in ~/dev",
+])
+def test_is_memory_candidate_matches(text):
+    from llm_communicator.tools import is_memory_candidate
+    assert is_memory_candidate(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "list the files", "sort them by size", "how do I find big files",
+    "execute that", "create a file called notes.txt",
+])
+def test_is_memory_candidate_rejects(text):
+    from llm_communicator.tools import is_memory_candidate
+    assert is_memory_candidate(text) is False
+
+
+@patch("llm_communicator.tools.litellm.completion")
+def test_extract_memories_parses_ops(mock_completion):
+    from llm_communicator.tools import extract_memories
+    mock_completion.return_value = MockResponse(MockMessage(content=json.dumps({
+        "operations": [{"op": "add", "content": "x is the project"}]
+    })))
+    ops = extract_memories("remember x is the project", [])
+    assert ops == [{"op": "add", "content": "x is the project"}]
+
+
+def test_memory_block_injected_into_system_prompt():
+    from llm_communicator import memory_manager
+    memory_manager.add_memory("~/school/llms/ass3 is the user's LLM class project folder")
+    agent = BashToolAgent(api_key="fake-key")
+    assert "LLM class project folder" in agent.system_prompt
+    assert "KNOWN FACTS ABOUT THE USER" in agent.system_prompt
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.extract_memories")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_memory_extractor_gated_off_for_plain_command(mock_exec, mock_completion, mock_extract, mock_load_config):
+    """A plain command must NOT trigger the memory sub-call."""
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    msg_gen = MockMessage(content='{"executable": true, "command": "ls", "explanation": "list", "rule_triggered": 1, "response_text": ""}')
+    msg_filter = MockMessage(content="DECISION: NO")
+    mock_completion.side_effect = [MockResponse(msg_gen), MockResponse(msg_filter)]
+    mock_exec.return_value = "out"
+
+    agent = BashToolAgent()
+    agent.run_single("list the files")
+    mock_extract.assert_not_called()
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.extract_memories")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_action_and_memory_from_one_instruction(mock_exec, mock_completion, mock_extract, mock_load_config):
+    """`move to X. this is my project folder.` -> the action runs AND the memory is stored."""
+    from llm_communicator import memory_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    msg_gen = MockMessage(content='{"executable": true, "command": "cd /home/u/school/llms/ass3", "explanation": "move", "rule_triggered": 1, "response_text": ""}')
+    msg_filter = MockMessage(content="DECISION: NO")
+    mock_completion.side_effect = [MockResponse(msg_gen), MockResponse(msg_filter)]
+    mock_exec.return_value = ""
+    mock_extract.return_value = [{"op": "add", "content": "~/school/llms/ass3 is the user's LLM class project folder"}]
+
+    agent = BashToolAgent()
+    agent.run_single("move to ~/school/llms/ass3. this is my LLM class project folder")
+
+    mock_extract.assert_called_once()
+    mems = memory_manager.load_memories()
+    assert len(mems) == 1 and "class project folder" in mems[0]["content"]
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_history_preserved_with_memory_injected(mock_execute_bash, mock_completion):
+    """KEY REGRESSION: with a memory injected into the system prompt, multi-turn history replay
+    and output capture must still work exactly as before."""
+    from llm_communicator import history_manager, memory_manager
+
+    memory_manager.add_memory("~/school/llms/ass3 is the user's LLM class project folder")
+    history_manager.append_history_turn("list files", "ls", "file1\nfile2")
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    tool_call = MockToolCall("call_new", "execute_bash_command", {"command": "ls -S", "explanation": "sort"})
+    msg_execute = MockMessage(tool_calls=[tool_call])
+    msg_filter = MockMessage(content="DECISION: NO")
+    mock_completion.side_effect = [MockResponse(msg_analyze), MockResponse(msg_execute), MockResponse(msg_filter)]
+    mock_execute_bash.return_value = "file2\nfile1"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("now sort them by size")
+
+    # 1) Memory lives in the SYSTEM message...
+    sys_msg = agent.conversation_history[0]
+    assert sys_msg["role"] == "system"
+    assert "LLM class project folder" in sys_msg["content"]
+
+    # 2) ...and the prior turn is still replayed intact AFTER it (history not disturbed).
+    assert any(m.get("role") == "user" and m.get("content") == "list files" for m in agent.conversation_history)
+    assert any(m.get("role") == "tool" and m.get("content") == "file1\nfile2" for m in agent.conversation_history)
+
+    # 3) Output of the new command is captured and persisted to history as before.
+    mock_execute_bash.assert_called_once_with("ls -S")
+    md = history_manager.get_history_metadata()
+    assert len(md) == 2
+    assert md[-1]["command"] == "ls -S"
+    full = history_manager.get_full_turns([2])
+    assert full[0]["output"] == "file2\nfile1"

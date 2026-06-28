@@ -9,6 +9,7 @@ if src_dir not in sys.path:
 from fixtures import OPENAI_API_KEY, MODEL_NAME, DOIT_SYSTEM_PROMPT, DOIT_FILTER_PROMPT, LLM_CONTEXT_LIMIT, CTX_NUM, MAX_CLARIFICATION_ROUNDS
 from doit_module.config_loader import load_config
 import llm_communicator.history_manager as history_manager
+import llm_communicator.memory_manager as memory_manager
 from llm_communicator.backup_system_prompts import FALLBACK_SYSTEM_INSTRUCTION, FEWSHOT_FALLBACK, FEWSHOT_TOOLCALL
 from llm_communicator.tools import (
     BashSafetyViolationError,
@@ -21,6 +22,8 @@ from llm_communicator.tools import (
     is_execute_suggestion_request,
     resolve_cd_hoist,
     resolve_session_state_hoist,
+    is_memory_candidate,
+    extract_memories,
     parse_json_response,
     is_openai_model,
     NO_ANSWER_SENTINEL,
@@ -107,6 +110,15 @@ class BashToolAgent:
         self.system_prompt = DOIT_SYSTEM_PROMPT
         if not self.tool_calling:
             self.system_prompt += "\n\n" + FALLBACK_SYSTEM_INSTRUCTION
+
+        # Persistent memory: inject known facts about the user into the system prompt on every
+        # invocation (empty for new users). Loaded fresh from the global store, so it is
+        # session/cwd-independent and reaches the main agent and the clarification decision. It
+        # goes into the SYSTEM message only - replayed history turns come after it, so history
+        # reference-resolution/replay is unaffected.
+        memory_block = memory_manager.render_memories()
+        if memory_block:
+            self.system_prompt += "\n\n" + memory_block
 
         self.conversation_history: List[Dict[str, Any]] = [
             {
@@ -276,6 +288,29 @@ class BashToolAgent:
 
         return True, explanation
 
+    def _store_memories(self, instruction: str, executed_command: str = "") -> None:
+        """
+        Persist durable facts/preferences from this instruction via the focused memory-manager
+        sub-call, applying its add/update/delete operations to the global store. Best-effort:
+        memory handling must never break the turn. Independent of the action, so one instruction
+        can both act and be remembered.
+        """
+        try:
+            existing = memory_manager.load_memories()
+            ops = extract_memories(instruction, existing, executed_command)
+            _debug("MEMORY ops:", ops)
+            applied = memory_manager.apply_operations(ops)
+            for op in applied:
+                kind = (op.get("op") or "").lower()
+                if kind == "add":
+                    print(f"[Memory] Noted: {op.get('content', '').strip()}")
+                elif kind == "update":
+                    print("[Memory] Updated a saved preference.")
+                elif kind == "delete":
+                    print("[Memory] Forgot a saved preference.")
+        except Exception as e:
+            _debug("MEMORY store failed:", e)
+
     def _hoist_cd(self, abspath: str) -> str:
         """
         Hoist a `cd` to the PARENT shell. A subprocess can never change the user's cwd, so when the
@@ -317,38 +352,56 @@ class BashToolAgent:
             print(f"[doit] shell integration is not active; to apply this run:\n  {command}")
         return f"[applied to shell: {command}]"
 
+    def _filter_confirm(self, command: str) -> Optional[str]:
+        """
+        Run the LLM filesystem-modification judge on `command`; if it judges the command modifies the
+        filesystem, ask the user [y/N]. Returns a cancellation marker string if the user declines,
+        else None (proceed). Shared by every execution path - subprocess commands AND hoisted
+        cd/session-state commands - so the filter vets them all.
+        """
+        modifies, filter_explanation = self._filter_bash(command)
+        if modifies:
+            print(f"This command will modify your file system: {filter_explanation}")
+            user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
+            if user_choice not in ('y', 'yes'):
+                return "[Cancelled: User declined to execute command that modifies the file system]"
+        return None
+
     def _dispatch_command(self, command: str) -> str:
         """
-        Run a generated command. A plain `cd` is value-hoisted to the parent shell (see _hoist_cd);
-        a single session-state builtin (export/alias/set/unset/shopt/pushd/popd) is command-hoisted
-        (see _hoist_shell); everything else goes through the sandboxed subprocess with the safety
-        filter and confirmation (see _execute_with_confirmation).
+        Run a generated command. Every command is first vetted by the filesystem-modification filter
+        (_filter_confirm), including hoisted ones - they run in the PARENT shell, so they must not skip
+        the safety gate. A plain `cd` is then value-hoisted (see _hoist_cd); a single session-state
+        builtin (export/alias/set/unset/shopt/pushd/popd) is command-hoisted (see _hoist_shell);
+        everything else runs in the sandboxed subprocess (which also applies the regex blacklist).
         """
         cd_target = resolve_cd_hoist(command)
-        if cd_target is not None:
-            _debug("CD hoist:", cd_target)
-            return self._hoist_cd(cd_target)
-        shell_cmd = resolve_session_state_hoist(command)
-        if shell_cmd is not None:
+        shell_cmd = resolve_session_state_hoist(command) if cd_target is None else None
+
+        if cd_target is not None or shell_cmd is not None:
+            cancelled = self._filter_confirm(command)   # vet the hoisted command too
+            if cancelled is not None:
+                return cancelled
+            if cd_target is not None:
+                _debug("CD hoist:", cd_target)
+                return self._hoist_cd(cd_target)
             _debug("SHELL-STATE hoist:", shell_cmd)
             return self._hoist_shell(shell_cmd)
+
         return self._execute_with_confirmation(command)
 
     def _execute_with_confirmation(self, command: str) -> str:
         """
         Run a command through the two safety layers: the LLM filesystem-modification judge
-        (asks the user for [y/N] before a modifying command) and the regex blacklist inside
+        (_filter_confirm, asks [y/N] before a modifying command) and the regex blacklist inside
         execute_bash. Returns the execution output (or a cancelled/error marker). Shared by the
         deterministic "execute that" route so suggestions get the same safety treatment as
         model-generated commands.
         """
         try:
-            modifies, filter_explanation = self._filter_bash(command)
-            if modifies:
-                print(f"This command will modify your file system: {filter_explanation}")
-                user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
-                if user_choice not in ('y', 'yes'):
-                    return "[Cancelled: User declined to execute command that modifies the file system]"
+            cancelled = self._filter_confirm(command)
+            if cancelled is not None:
+                return cancelled
             return execute_bash(command)
         except BashSafetyViolationError as safety_err:
             return f"[Error: {str(safety_err)}]"
@@ -782,3 +835,11 @@ class BashToolAgent:
                 llm_relevant_ids,
                 suggested_command=suggested_command,
             )
+
+        # Persistent memory: store durable facts/preferences from this instruction, independent of
+        # the action above (so "move to X. this is my project folder." both cd's and remembers).
+        # Gated so ordinary commands skip the sub-call. The deterministic how-to/execute routes
+        # return earlier, but their phrasings never match is_memory_candidate, so memory statements
+        # always reach here via the main pipeline.
+        if is_memory_candidate(instruction):
+            self._store_memories(instruction, executed_command)
