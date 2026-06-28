@@ -1,0 +1,115 @@
+// Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Multi-Turn Stage 2 - adds clarification)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = false). The model has no native tool
+// calling, so it emits a raw fallback-JSON block; execution output and clarification answers are
+// fed back as USER messages to keep strictly alternating user/assistant roles.
+//
+// Stage 2 layers the clarification feature on top of Stage 1. Per user turn @T the LLM contexts
+// are, in order:
+//   1) HistoryReferenceResolver - picks which prior turns are relevant     (unchanged vs Stage 1)
+//   2) DoitNonToolUseAgent      - generates a command OR flags needs_clarification; now seeded with
+//                                 in-context few-shot demos and re-invoked once per clarification step @T.i
+//   3) ClarificationAuthor      - NEW: focused call that AUTHORS the clarifying question whenever
+//                                 the agent sets needs_clarification
+//   4) BashFilter               - judges whether the final command modifies the filesystem (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i (the new within-turn
+// axis). Clarification is bounded to MAX_CLARIFICATION_ROUNDS (= 2) steps per turn. Across
+// turns nothing changes vs Stage 1: the chosen answer is FOLDED into the stored prompt
+// (e.g. "<instruction> [clarified: <answer>]"), so replayed history carries only that folded
+// prompt - the question/answer exchange itself is never replayed.
+//
+// Convention: range(1, @T) and any index < @T refer to prior turns; @T is the current turn.
+
+
+// 1. History Reference Resolver (_analyze_references) - unchanged from Stage 1.
+//    One user message: the new instruction plus prior command history as metadata only
+//    (id, prompt, command - NO output), last 20 turns, command-bearing only, newest-first.
+//    Skipped (no LLM context) when the instruction has no contextual indicator word.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]   // newest-first; command-bearing turns only; fields: [id, prompt, command]
+    }
+}
+
+
+// 2. Doit Main Agent (DoitNonToolUseAgent)
+//    System prompt + fallback-JSON instructions, then fixed in-context few-shot demonstrations of
+//    the ask-vs-execute decision, then the replayed relevant history, then the new instruction,
+//    then a bounded clarification loop. The agent is invoked once per clarification step @T.i.
+//    As in Stage 1, the A:/T: notation is the LOGICAL view (we are still "calling a tool"); the
+//    inline comments give the wire form (assistant fallback-JSON, answers folded into user turns).
+DoitNonToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt
+        sys.fallback_system_instruction
+    }
+
+    // Injected few-shot demonstrations (FEWSHOT_FALLBACK): standalone message turns appended AFTER
+    // the system message and BEFORE the history. Each demo is a user/assistant pair (no native
+    // tools). Fixed every turn; teaches the decision.
+    ForEach(@d: sys.fewshot_fallback) {
+        U: sys.fewshot_fallback[@d].instruction
+        A: sys.fewshot_fallback[@d].response   // fallback JSON: a command (executable=true) OR needs_clarification=true
+    }
+
+    // Replayed relevant history (resolved + transitively chained ids), ascending order. Same as
+    // Stage 1; the prompt may already carry a folded "[clarified: <answer>]" suffix.
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids) {
+        U: sys.pid.turn[@t].prompt
+        If(sys.pid.turn[@t].command != "") {
+            A: sys.pid.tool_call[@t]            // logical command call; SERIALIZED as an assistant fallback-JSON block with executable=true, command, explanation="execute <command>", rule_triggered=1
+            T: sys.pid.turn[@t].output          // logical tool result; SERIALIZED as a USER message folded into the next prompt ("Command execution output: <output>"); truncated to 2000 chars
+        } Else {
+            A: sys.pid.turn[@t].output          // turn produced no command: plain assistant message
+        }
+    }
+
+    U: env.user_input[@T]
+
+    // Bounded clarification loop (at most MAX_CLARIFICATION_ROUNDS rounds). On each round the agent
+    // is re-invoked; while it flags needs_clarification, the question authored by ClarificationAuthor
+    // is put to the user and the answer is fed back, then the agent runs again. On the final round
+    // the agent must commit to a command.
+    ForEach(i: pid.clarification_steps[@T]) {   // i = step within turn @T; bounded by MAX_CLARIFICATION_ROUNDS (2)
+        If(resp.pid.doit_non_tool_use_agent[@T.i].needs_clarification) {
+            A: resp.pid.doit_non_tool_use_agent[@T.i]   // fallback JSON with needs_clarification=true, executable=false, command="", rule_triggered=8
+            T: env.user_clarification_answer[@T.i]      // logical answer; SERIALIZED as a USER message ("Clarification ... <answer>") via _clarification_followup; or a no-answer sentinel
+        }
+    }
+    // The loop ends when the agent emits a command JSON (executable=true), handled by BashFilter below.
+}
+
+
+// 3. Clarification Author (_author_clarification) - NEW in Stage 2.
+//    Invoked at step @T.i whenever the agent flags needs_clarification. A focused single-purpose
+//    call: model and endpoint are read from doit.cfg, and it authors the actual clarifying
+//    question (and optional options) from the instruction alone. Its output drives the interactive
+//    menu shown to the user; the user's reply becomes env.user_clarification_answer[@T.i] above.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]                       // only the instruction; returns a question plus optional options
+}
+
+
+// 4. Bash Filter (_filter_bash) - unchanged from Stage 1.
+//    Invoked only when the agent finally emits a command. One user message: the fixed question
+//    concatenated with the generated command. Classifies DECISION: YES / NO.
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction             // "Does the following command modify the file system?"
+        resp.pid.doit_non_tool_use_agent[@T].command   // command field of the final fallback-JSON command object
+    }
+}
