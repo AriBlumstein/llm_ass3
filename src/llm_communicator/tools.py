@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 import litellm
 
-from fixtures import CLARIFY_AUTHOR_PROMPT, CTX_NUM
+from fixtures import CLARIFY_AUTHOR_PROMPT, ANSWER_HOWTO_PROMPT, CTX_NUM
 from doit_module.config_loader import load_config
 
 
@@ -77,6 +77,22 @@ class BashCommandInput(BaseModel):
     explanation: str = Field(
         ...,
         description="A short explanation of what this bash command will perform on the host system."
+    )
+
+
+class AnswerInput(BaseModel):
+    """
+    Schema for the `answer_question` tool: an informational/how-to reply that is NOT
+    executed. Mirrors BashCommandInput, but `suggested_command` is purely advisory - it
+    is shown to the user and persisted so a later "execute it" can run it.
+    """
+    explanation: str = Field(
+        ...,
+        description="The answer or how-to explanation to display to the user."
+    )
+    suggested_command: str = Field(
+        default="",
+        description="Optional bash command the user could run to accomplish this. Empty string if none applies. This is NOT executed - it is only suggested."
     )
 
 
@@ -289,6 +305,80 @@ def _author_clarification(instruction: str) -> tuple:
     return question, options
 
 
+# How-to question openers. Detected deterministically (in Python) so weak non-tool-calling
+# models never have to CLASSIFY the request - they only have to ANSWER it via answer_howto_question.
+HOWTO_PATTERNS = [
+    r"^\s*how (do|would|can|could|should) (i|you)\b",
+    r"^\s*how to\b",
+    r"^\s*what('?s| is| are) the (command|commands|way|steps) (to|for)\b",
+    r"^\s*what command\b",
+]
+
+
+def is_howto_question(instruction: str) -> bool:
+    """
+    True when the instruction is phrased as a how-to question ("how would I ...",
+    "what's the command to ..."). Deterministic so it does not depend on the model
+    classifying correctly. Follow-ups like "execute that"/"modify it" are NOT how-to
+    phrased and intentionally do not match.
+    """
+    text = instruction or ""
+    return any(re.search(p, text, re.IGNORECASE) for p in HOWTO_PATTERNS)
+
+
+# "Run the previously suggested command" openers. Detected deterministically so a weak
+# non-tool-calling model never has to emit the execute turn itself (it tends to return empty
+# or mislabel it). The most recent suggested_command from history is run directly instead.
+EXECUTE_SUGGESTION_PATTERNS = [
+    r"^\s*(execute|run)\s+(it|that|this|the\s+(command|suggestion|previous\s+command))\b",
+    r"^\s*do\s+(it|that|this)\b",
+    r"^\s*go\s+ahead\b",
+    r"^\s*yes,?\s+(run|execute|do)\b",
+]
+
+
+def is_execute_suggestion_request(instruction: str) -> bool:
+    """
+    True when the instruction asks to run a previously suggested command ("execute that",
+    "run it", "go ahead"). Deterministic, so the weak model never has to produce the execute
+    turn itself.
+    """
+    text = instruction or ""
+    return any(re.search(p, text, re.IGNORECASE) for p in EXECUTE_SUGGESTION_PATTERNS)
+
+
+def answer_howto_question(instruction: str) -> tuple:
+    """
+    Answer a how-to question via a focused, single-purpose LLM call (model/endpoint from
+    doit.cfg). The tight prompt has none of the multi-rule/clarification machinery, so a weak
+    local model just answers instead of mis-routing to a clarification. Returns
+    (explanation, suggested_command); falls back to a generic explanation on failure.
+    """
+    model_name, api_base, tool_calling = load_config()
+    completion_params = {
+        "model": model_name,
+        "api_base": api_base,
+        "messages": [
+            {"role": "system", "content": ANSWER_HOWTO_PROMPT},
+            {"role": "user", "content": instruction},
+        ],
+    }
+    if not tool_calling and not is_openai_model(model_name):
+        completion_params["num_ctx"] = CTX_NUM
+
+    try:
+        response = litellm.completion(**completion_params)
+        parsed = parse_json_response(response.choices[0].message.content or "")
+        explanation = (parsed.get("explanation") or "").strip()
+        suggested = (parsed.get("suggested_command") or "").strip()
+    except Exception:
+        explanation, suggested = "", ""
+
+    if not explanation and not suggested:
+        explanation = f"I could not produce an answer for: {instruction}"
+    return explanation, suggested
+
+
 def ask_user_clarification(instruction: str) -> str:
     """
     Implementation of the `ask_user_clarification` tool. Invoked only when the agent decides the
@@ -313,6 +403,21 @@ EXECUTE_TOOL_DEF: Dict[str, Any] = {
             "Instead, for this warning, you MUST return a plain text response directly without any tool call."
         ),
         "parameters": BashCommandInput.model_json_schema()
+    }
+}
+
+ANSWER_TOOL_DEF: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "answer_question",
+        "description": (
+            "Use this ONLY to ANSWER an informational or how-to question about the shell "
+            "(e.g. 'how do I find files over 100MB?', 'what does chmod do?') WITHOUT executing "
+            "anything. Provide an 'explanation' and, when a command applies, a 'suggested_command' "
+            "the user COULD run. This tool NEVER executes the command - it only explains and "
+            "suggests. To actually run a command, use execute_bash_command instead."
+        ),
+        "parameters": AnswerInput.model_json_schema()
     }
 }
 

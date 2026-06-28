@@ -373,8 +373,8 @@ def test_history_manager_basic_operations(tmp_path, monkeypatch):
     # Verify metadata (outputs omitted)
     metadata = history_manager.get_history_metadata()
     assert len(metadata) == 2
-    assert metadata[0] == {"id": 1, "prompt": "list files", "command": "ls"}
-    assert metadata[1] == {"id": 2, "prompt": "show process", "command": "ps"}
+    assert metadata[0] == {"id": 1, "prompt": "list files", "command": "ls", "suggested_command": ""}
+    assert metadata[1] == {"id": 2, "prompt": "show process", "command": "ps", "suggested_command": ""}
     
     # Verify full turns retrieval
     full_turns = history_manager.get_full_turns([1])
@@ -595,6 +595,9 @@ def test_history_system_instruction_rules():
     assert "chronological order" in HISTORY_SYSYEM_INSTRUCTION
     assert "SAFETY CHECK" in HISTORY_SYSYEM_INSTRUCTION
     assert "most recent one (the command with the larger ID)" in HISTORY_SYSYEM_INSTRUCTION
+    # The resolver must treat answer turns (suggested-but-not-executed) as linkable so
+    # "execute that" / "modify it" can refer back to them.
+    assert "Suggested (not executed)" in HISTORY_SYSYEM_INSTRUCTION
 
 
 def test_doit_system_prompt_cancelled_rules():
@@ -1012,3 +1015,344 @@ def test_fallback_instruction_documents_needs_clarification():
     """The fallback JSON contract documents the needs_clarification flag."""
     from llm_communicator.llm_bash import FALLBACK_SYSTEM_INSTRUCTION
     assert "needs_clarification" in FALLBACK_SYSTEM_INSTRUCTION
+
+
+# =====================================================================
+# SECTION: Richer interactions (answer_question + execute it / modify it)
+# =====================================================================
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_answer_question_does_not_execute_and_persists_suggestion(mock_execute_bash, mock_completion):
+    """A how-to question -> answer_question tool: nothing runs, the suggestion is persisted."""
+    from llm_communicator import history_manager
+
+    answer_call = MockToolCall("call_ans", "answer_question", {
+        "explanation": "Use find with -size to filter by file size.",
+        "suggested_command": "find . -size +100M",
+    })
+    # Empty history => no analyze LLM call; only the generation call happens.
+    mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[answer_call]))]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    with patch("builtins.input") as mock_input:
+        agent.run_single("how do I find files larger than 100MB?")
+        mock_input.assert_not_called()
+
+    mock_execute_bash.assert_not_called()
+    assert mock_completion.call_count == 1
+
+    turns = history_manager.get_history_metadata(limit=10)
+    assert len(turns) == 1
+    assert turns[-1]["command"] == ""
+    assert turns[-1]["suggested_command"] == "find . -size +100M"
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_execute_it_runs_previously_suggested_command(mock_execute_bash, mock_completion):
+    """'execute it' resolves a prior answer turn and runs its suggested command."""
+    from llm_communicator import history_manager
+
+    # Seed an answer turn that suggested (but did not run) a command.
+    history_manager.append_history_turn(
+        "how do I find files larger than 100MB?",
+        "",
+        "Use find with -size to filter by file size.",
+        relevant_ids=[],
+        suggested_command="find . -size +100M",
+    )
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    exec_call = MockToolCall("call_exec", "execute_bash_command",
+                             {"command": "find . -size +100M", "explanation": "find large files"})
+    msg_execute = MockMessage(tool_calls=[exec_call])
+    msg_filter = MockMessage(content="DECISION: NO")
+
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(msg_execute),
+        MockResponse(msg_filter),
+    ]
+    mock_execute_bash.return_value = "./big.iso"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    with patch("builtins.input") as mock_input:
+        agent.run_single("execute it")
+        mock_input.assert_not_called()  # read-only command -> no confirmation prompt
+
+    mock_execute_bash.assert_called_once_with("find . -size +100M")
+
+    # The prior answer turn was replayed as an answer_question tool call so the model
+    # could see the suggested command.
+    replayed = [
+        tc["function"]["name"]
+        for msg in agent.conversation_history
+        for tc in (msg.get("tool_calls") or [])
+    ]
+    assert "answer_question" in replayed
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_modify_it_revises_suggestion_without_executing(mock_execute_bash, mock_completion):
+    """'modify it to ...' produces a new answer_question with the revised suggestion; nothing runs."""
+    from llm_communicator import history_manager
+
+    history_manager.append_history_turn(
+        "how do I find files larger than 100MB?",
+        "",
+        "Use find with -size.",
+        relevant_ids=[],
+        suggested_command="find . -size +100M",
+    )
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    answer_call = MockToolCall("call_ans2", "answer_question", {
+        "explanation": "Raise the size threshold to 1GB.",
+        "suggested_command": "find . -size +1G",
+    })
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(MockMessage(tool_calls=[answer_call])),
+    ]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+
+    agent.run_single("modify it to find files over 1GB")
+
+    mock_execute_bash.assert_not_called()
+    turns = history_manager.get_history_metadata(limit=10)
+    assert turns[-1]["suggested_command"] == "find . -size +1G"
+    assert turns[-1]["command"] == ""
+
+
+def test_answer_tool_offered_in_tool_list():
+    """The generator is offered the answer_question tool alongside execute/clarify."""
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    names = {t["function"]["name"] for t in agent._build_tools(include_clarification=True)}
+    assert {"execute_bash_command", "answer_question", "ask_user_clarification"} <= names
+    # On the final round the clarification tool is withdrawn, but answer_question stays.
+    final = {t["function"]["name"] for t in agent._build_tools(include_clarification=False)}
+    assert "answer_question" in final
+    assert "ask_user_clarification" not in final
+
+
+def test_system_prompt_documents_answer_rule():
+    """DOIT_SYSTEM_PROMPT documents the answer_question / execute-it behavior."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    assert "answer_question" in DOIT_SYSTEM_PROMPT
+    lowered = DOIT_SYSTEM_PROMPT.lower()
+    assert "how-to" in lowered or "how do i" in lowered
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_answer_persists_suggestion(mock_execute_bash, mock_completion, mock_load_config):
+    """Non-tool-calling Rule 9 answer: nothing runs, suggested_command is persisted from JSON."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+
+    # Empty history => no analyze LLM call; only the generation call.
+    msg_gen = MockMessage(content=json.dumps({
+        "executable": False, "command": "", "suggested_command": "find . -type f -perm -111 -print",
+        "explanation": "how-to", "rule_triggered": 9,
+        "response_text": "Use find: find . -type f -perm -111 -print", "needs_clarification": False,
+    }))
+    mock_completion.side_effect = [MockResponse(msg_gen)]
+
+    agent = BashToolAgent()
+    assert agent.tool_calling is False
+    agent.run_single("how would I view all the executable files recursively")
+
+    mock_execute_bash.assert_not_called()
+    turns = history_manager.get_history_metadata(limit=10)
+    assert len(turns) == 1
+    assert turns[-1]["command"] == ""
+    assert turns[-1]["suggested_command"] == "find . -type f -perm -111 -print"
+
+
+def test_fallback_instruction_documents_suggested_command():
+    """The fallback JSON contract documents the suggested_command field and Rule 9."""
+    from llm_communicator.llm_bash import FALLBACK_SYSTEM_INSTRUCTION
+    assert "suggested_command" in FALLBACK_SYSTEM_INSTRUCTION
+    assert '"rule_triggered": 9' in FALLBACK_SYSTEM_INSTRUCTION
+
+
+# =====================================================================
+# SECTION: Deterministic how-to routing (fallback mode)
+# =====================================================================
+
+@pytest.mark.parametrize("text", [
+    "how would I view all the executable files recursively in the cwd",
+    "how do I count the lines in a file",
+    "How can I find empty directories?",
+    "how to list hidden files",
+    "what's the command to show disk usage",
+    "what is the command for listing processes",
+])
+def test_is_howto_question_matches(text):
+    from llm_communicator.tools import is_howto_question
+    assert is_howto_question(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "list the files in my home folder",
+    "execute that",
+    "modify it to find files over 1GB",
+    "create a file called notes.txt",
+    "remove the directory we just made",
+])
+def test_is_howto_question_rejects_non_howto(text):
+    from llm_communicator.tools import is_howto_question
+    assert is_howto_question(text) is False
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.answer_howto_question")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_howto_route_answers_and_persists(mock_execute_bash, mock_answer, mock_load_config):
+    """In fallback mode a how-to question is deterministically routed to the answer sub-call:
+    it answers, persists the suggestion, and never runs the main generation loop."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    mock_answer.return_value = (
+        "Use find to list executable files recursively.",
+        "find . -type f -perm -111 -print",
+    )
+
+    agent = BashToolAgent()
+    assert agent.tool_calling is False
+
+    with patch("llm_communicator.llm_bash.litellm.completion") as mock_completion:
+        agent.run_single("how would I view all the executable files recursively in the cwd")
+        # The deterministic route must NOT invoke the main generator/filter at all.
+        mock_completion.assert_not_called()
+
+    mock_answer.assert_called_once()
+    mock_execute_bash.assert_not_called()
+
+    turns = history_manager.get_history_metadata(limit=10)
+    assert len(turns) == 1
+    assert turns[-1]["command"] == ""
+    assert turns[-1]["suggested_command"] == "find . -type f -perm -111 -print"
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.answer_howto_question")
+def test_tool_calling_does_not_use_howto_route(mock_answer, mock_load_config):
+    """Native tool-calling models keep the Rule 9 / answer_question path; the deterministic
+    fallback route must not fire for them."""
+    mock_load_config.return_value = ("openai/gpt-5.4-nano", None, True)
+    answer_call = MockToolCall("call_ans", "answer_question", {
+        "explanation": "Use find ...", "suggested_command": "find . -type f -perm -111",
+    })
+    with patch("llm_communicator.llm_bash.litellm.completion") as mock_completion:
+        mock_completion.side_effect = [MockResponse(MockMessage(tool_calls=[answer_call]))]
+        agent = BashToolAgent(api_key="fake-key")
+        assert agent.tool_calling is True
+        agent.run_single("how would I view executable files")
+
+    mock_answer.assert_not_called()
+
+
+@patch("llm_communicator.tools.litellm.completion")
+def test_answer_howto_question_parses_subcall(mock_completion):
+    """answer_howto_question returns (explanation, suggested_command) from the focused sub-call."""
+    from llm_communicator.tools import answer_howto_question
+    mock_completion.return_value = MockResponse(MockMessage(content=json.dumps({
+        "explanation": "Count lines with wc.", "suggested_command": "wc -l file.txt",
+    })))
+    explanation, suggested = answer_howto_question("how do I count lines in file.txt")
+    assert explanation == "Count lines with wc."
+    assert suggested == "wc -l file.txt"
+
+
+# =====================================================================
+# SECTION: Deterministic "execute that" routing (fallback mode)
+# =====================================================================
+
+@pytest.mark.parametrize("text", [
+    "execute that", "run it", "run that", "execute it",
+    "do it", "go ahead", "yes, run it", "run the command",
+])
+def test_is_execute_suggestion_request_matches(text):
+    from llm_communicator.tools import is_execute_suggestion_request
+    assert is_execute_suggestion_request(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "list the files", "how would I run a script", "create a file called run",
+    "show running processes",
+])
+def test_is_execute_suggestion_request_rejects(text):
+    from llm_communicator.tools import is_execute_suggestion_request
+    assert is_execute_suggestion_request(text) is False
+
+
+def test_get_latest_suggested_command(tmp_path, monkeypatch):
+    from llm_communicator import history_manager
+    test_file = tmp_path / "h.jsonl"
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+
+    assert history_manager.get_latest_suggested_command() is None
+    history_manager.append_history_turn("q1", "", "ans1", [], suggested_command="ls -la")
+    history_manager.append_history_turn("ran", "ls -la", "out", [1])  # executed, no suggestion
+    history_manager.append_history_turn("q2", "", "ans2", [], suggested_command="find . -type f")
+
+    assert history_manager.get_latest_suggested_command() == (3, "find . -type f")
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_execute_route_runs_latest_suggestion(mock_execute_bash, mock_completion, mock_load_config):
+    """In fallback mode 'execute that' deterministically runs the latest suggested command
+    through the safety filter, without relying on the model to emit an execute turn."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+
+    history_manager.append_history_turn(
+        "how would I list executable files recursively", "", "Use find ...",
+        [], suggested_command="find . -type f -perm -111 -print",
+    )
+
+    # Only the safety-filter call should hit the model; the main generator must not.
+    mock_completion.return_value = MockResponse(MockMessage(content="DECISION: NO"))
+    mock_execute_bash.return_value = "./run.sh"
+
+    agent = BashToolAgent()
+    with patch("builtins.input") as mock_input:
+        agent.run_single("execute that")
+        mock_input.assert_not_called()  # read-only -> no [y/N]
+
+    mock_execute_bash.assert_called_once_with("find . -type f -perm -111 -print")
+    turns = history_manager.get_history_metadata(limit=10)
+    assert turns[-1]["command"] == "find . -type f -perm -111 -print"
+    # The executed turn links back to the answer turn that supplied the suggestion.
+    full = history_manager.get_full_turns([2])
+    assert full[0]["relevant_ids"] == [1]
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_execute_route_falls_through_without_suggestion(mock_execute_bash, mock_completion, mock_load_config):
+    """'execute that' with no prior suggestion falls through to normal handling (no crash)."""
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    # No history. Empty model response should be handled gracefully (no junk turn).
+    mock_completion.return_value = MockResponse(MockMessage(content=""))
+
+    agent = BashToolAgent()
+    agent.run_single("execute that")
+
+    mock_execute_bash.assert_not_called()
+    from llm_communicator import history_manager
+    assert history_manager.get_history_metadata() == []  # nothing junk persisted

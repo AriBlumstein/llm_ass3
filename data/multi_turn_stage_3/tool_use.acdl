@@ -1,0 +1,106 @@
+// Doit Agent Context: Tool Use Scenario (Multi-Turn Stage 3 - adds answering + execute/modify a suggestion)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = true).
+// Stage 3 layers "richer interactions" on top of Stage 2: the agent can now ANSWER a how-to question
+// (suggesting, not running, a command) and can EXECUTE or MODIFY a command it suggested earlier. In
+// tool-use mode this adds NO new control flow vs Stage 2 - only a third tool and a Rule 9. Per user
+// turn @T the LLM contexts are, in order:
+//   1) HistoryReferenceResolver - picks relevant prior turns; now ALSO links answer turns      (CHANGED)
+//   2) DoitToolUseAgent         - generates a command, ANSWERS a how-to, or asks to clarify    (CHANGED)
+//   3) ClarificationAuthor      - authors the clarifying question                              (unchanged)
+//   4) BashFilter               - judges whether an executed command modifies the filesystem   (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Clarification is bounded
+// to MAX_CLARIFICATION_ROUNDS (= 2). Convention: any index < @T refers to a prior turn.
+
+
+// 1. History Reference Resolver (_analyze_references) - CHANGED vs Stage 2.
+//    One user message: the new instruction plus prior history as metadata only (id, prompt, command,
+//    and NOW suggested_command - still NO output), last 20 turns, newest-first. A turn is now eligible
+//    if it has a command OR a suggested_command, so answer turns can be referenced; and the system
+//    prompt treats a "Suggested (not executed)" command as a referent for "execute that" / "modify it".
+//    Still skipped (no LLM context) when the instruction has no contextual indicator word.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // CHANGED: a suggested (not executed) command is a valid link target
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]   // newest-first; turns with a command OR suggested_command; fields: [id, prompt, command, suggested_command]
+    }
+}
+
+
+// 2. Doit Main Agent (DoitToolUseAgent) - CHANGED vs Stage 2.
+//    System prompt + native tool schema, then the fixed few-shot, then replayed relevant history, then
+//    the new instruction, then the bounded clarification loop. Invoked once per clarification step @T.i.
+DoitToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // CHANGED: adds Rule 9 (answer a how-to; execute or modify a prior suggestion)
+        sys.tools_definition                    // CHANGED: now execute_bash_command, answer_question, AND ask_user_clarification
+    }
+
+    // Fixed in-context few-shot (FEWSHOT_TOOLCALL) - unchanged from Stage 2 (clear -> execute,
+    // ambiguous -> clarify). Each demo is a triple.
+    ForEach(@d: sys.fewshot_toolcall) {
+        U: sys.fewshot_toolcall[@d].instruction
+        A: sys.fewshot_toolcall[@d].tool_call   // execute_bash_command OR ask_user_clarification call
+        T: sys.fewshot_toolcall[@d].result      // command output, or the clarification answer
+    }
+
+    // Replayed relevant history (resolved + transitively chained ids), ascending. CHANGED: a NEW middle
+    // branch replays ANSWER turns (no command, but a suggested_command) as an answer_question tool call,
+    // so the agent sees the suggestion it made and can act on "execute that" / "modify it".
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids) {
+        U: sys.pid.turn[@t].prompt
+        If(sys.pid.turn[@t].command != "") {
+            A: sys.pid.tool_call[@t]            // execute_bash_command tool call
+            T: sys.pid.turn[@t].output          // tool result; truncated to 2000 chars
+        } Else {
+            If(sys.pid.turn[@t].suggested_command != "") {
+                A: sys.pid.answer_call[@t]      // NEW: answer_question call (explanation = stored output, suggested_command)
+                T: ANSWER_DELIVERED_NOTICE      // fixed tool result: suggestion delivered, NOT executed
+            } Else {
+                A: sys.pid.turn[@t].output      // turn produced neither: plain assistant message
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    // Bounded clarification loop - unchanged from Stage 2. On the final round ask_user_clarification is
+    // withdrawn (execute_bash_command and answer_question remain).
+    ForEach(i: pid.clarification_steps[@T]) {   // i = step within turn @T; bounded by MAX_CLARIFICATION_ROUNDS (2)
+        If(resp.pid.doit_tool_use_agent[@T.i].asks_clarification) {
+            A: resp.pid.doit_tool_use_agent[@T.i].ask_user_clarification_call   // tool call; optional "reason" arg
+            T: env.user_clarification_answer[@T.i]   // user's answer, restated via _clarification_followup; or no-answer sentinel
+        }
+    }
+    // The loop ends on a TERMINAL action: execute_bash_command (-> BashFilter, may execute);
+    // answer_question (terminal, stored with its suggested_command, nothing executed); or plain text.
+}
+
+
+// 3. Clarification Author (_author_clarification) - unchanged from Stage 2.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]                       // only the instruction; returns a question plus optional options
+}
+
+
+// 4. Bash Filter (_filter_bash) - unchanged from Stage 2.
+//    Invoked only when the agent emits an execute_bash_command call (never for answer_question).
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction             // "Does the following command modify the file system?"
+        resp.pid.doit_tool_use_agent[@T].tool_call[0].command   // command arg of the final execute_bash_command call
+    }
+}

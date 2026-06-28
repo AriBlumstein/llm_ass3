@@ -1,0 +1,128 @@
+// Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Multi-Turn Stage 3 - adds answering + execute/modify a suggestion)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = false). No native tools: the model emits a raw
+// fallback-JSON block; execution output and clarification answers are fed back as USER messages to keep
+// strictly alternating user/assistant roles.
+//
+// Stage 3 layers "richer interactions" on top of Stage 2. Because the weak local model cannot reliably
+// CLASSIFY these requests, Stage 3 adds two DETERMINISTIC Python checks that run BEFORE the Stage-2
+// pipeline and can short-circuit the turn:
+//   - how-to question    (is_howto_question)            -> HowtoAnswerSubcall (context 0), then DONE.
+//   - "execute that"     (is_execute_suggestion_request) AND a prior suggested_command exists
+//                                                        -> run that command straight through BashFilter
+//                                                           (context 4), then DONE.
+// Otherwise the Stage-2 pipeline runs, now extended for answers:
+//   1) HistoryReferenceResolver - picks relevant prior turns; now ALSO links answer turns      (CHANGED)
+//   2) DoitNonToolUseAgent      - generates a command, ANSWERS a how-to, or flags clarification (CHANGED)
+//   3) ClarificationAuthor      - authors the clarifying question                              (unchanged)
+//   4) BashFilter               - judges whether a command modifies the filesystem             (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Clarification is bounded
+// to MAX_CLARIFICATION_ROUNDS (= 2). Convention: any index < @T refers to a prior turn.
+
+
+// 0. How-to Answer Sub-call (answer_howto_question) - NEW in Stage 3.
+//    Runs (instead of the whole pipeline below) when is_howto_question(env.user_input[@T]) matches. A
+//    focused single-purpose call - model/endpoint from doit.cfg, none of the multi-rule or
+//    clarification machinery - so the weak model just answers. Returns (explanation, suggested_command)
+//    the turn is stored with that suggested_command (command = "") so a later "execute that" can run it.
+HowtoAnswerSubcall[@T]: {
+    S: {
+        sys.answer_howto_prompt
+    }
+
+    U: env.user_input[@T]                       // only the instruction; returns explanation + suggested_command
+}
+
+
+// 1. History Reference Resolver (_analyze_references) - CHANGED vs Stage 2.
+//    One user message: the new instruction plus prior history as metadata only (id, prompt, command,
+//    and NOW suggested_command - still NO output), last 20 turns, newest-first. A turn is now eligible
+//    if it has a command OR a suggested_command, so answer turns can be referenced; and the system
+//    prompt treats a "Suggested (not executed)" command as a referent. Still skipped (no LLM context)
+//    when the instruction has no contextual indicator word.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // CHANGED: a suggested (not executed) command is a valid link target
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]   // newest-first; turns with a command OR suggested_command; fields: [id, prompt, command, suggested_command]
+    }
+}
+
+
+// 2. Doit Main Agent (DoitNonToolUseAgent) - CHANGED vs Stage 2.
+//    System prompt + fallback-JSON instructions, then the fixed few-shot, then replayed relevant
+//    history, then the new instruction, then the bounded clarification loop. The A:/T: notation is the
+//    LOGICAL view; inline comments give the wire form (assistant fallback-JSON, results/answers folded
+//    into user turns).
+DoitNonToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // CHANGED: adds Rule 9 (answer a how-to; execute or modify a prior suggestion)
+        sys.fallback_system_instruction         // CHANGED: documents the suggested_command field and rule_triggered=9
+    }
+
+    // Fixed in-context few-shot (FEWSHOT_FALLBACK) - CHANGED: now ALSO demonstrates how-to -> Rule 9
+    // answer (with a suggested_command) and "execute that" -> run the suggestion. Each demo is a pair.
+    ForEach(@d: sys.fewshot_fallback) {
+        U: sys.fewshot_fallback[@d].instruction
+        A: sys.fewshot_fallback[@d].response    // fallback JSON: command (executable=true) | needs_clarification | rule-9 answer with suggested_command
+    }
+
+    // Replayed relevant history (resolved + transitively chained ids), ascending. CHANGED: a NEW middle
+    // branch replays ANSWER turns as a Rule 9 fallback-JSON block (and, unlike a command turn, with NO
+    // following user message - the answer produced no execution output to feed back).
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids) {
+        U: sys.pid.turn[@t].prompt
+        If(sys.pid.turn[@t].command != "") {
+            A: sys.pid.tool_call[@t]            // SERIALIZED: assistant fallback-JSON, executable=true, command, explanation="execute <command>", rule_triggered=1
+            T: sys.pid.turn[@t].output          // SERIALIZED: USER message "Command execution output: <output>"; truncated to 2000 chars
+        } Else {
+            If(sys.pid.turn[@t].suggested_command != "") {
+                A: sys.pid.answer_replay[@t]    // NEW, SERIALIZED: assistant fallback-JSON, executable=false, suggested_command, rule_triggered=9, response_text=<stored output>
+            } Else {
+                A: sys.pid.turn[@t].output      // turn produced neither: plain assistant message
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    // Bounded clarification loop - unchanged from Stage 2.
+    ForEach(i: pid.clarification_steps[@T]) {   // i = step within turn @T; bounded by MAX_CLARIFICATION_ROUNDS (2)
+        If(resp.pid.doit_non_tool_use_agent[@T.i].needs_clarification) {
+            A: resp.pid.doit_non_tool_use_agent[@T.i]   // fallback JSON: needs_clarification=true, executable=false, command="", rule_triggered=8
+            T: env.user_clarification_answer[@T.i]      // SERIALIZED as a USER message via _clarification_followup; or a no-answer sentinel
+        }
+    }
+    // The loop ends on a TERMINAL fallback-JSON block: executable=true (a command -> BashFilter);
+    // rule_triggered=9 (an answer, terminal, stored with its suggested_command); or a rejection/chat.
+}
+
+
+// 3. Clarification Author (_author_clarification) - unchanged from Stage 2.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]                       // only the instruction; returns a question plus optional options
+}
+
+
+// 4. Bash Filter (_filter_bash) - unchanged prompt; NOW reached from two places.
+//    One user message: the fixed question concatenated with the command to judge. The command is EITHER
+//    the main agent's final command (the pipeline) OR the latest suggested command (the "execute that"
+//    short-circuit described in the header).
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction             // "Does the following command modify the file system?"
+        resp.pid.doit_non_tool_use_agent[@T].command   // pipeline; OR, on the "execute that" short-circuit, sys.pid.latest_suggested_command[@T]
+    }
+}

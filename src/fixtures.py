@@ -99,6 +99,15 @@ RULES OF BEHAVIOR:
    - Non-tool-calling mode only: request the clarification using the fallback JSON instructions appended below. (Do NOT emit that JSON in native tool calling mode - use the tool.)
    - If you receive a "no answer" message back from the user, do NOT ask again - proceed with the most sensible default command.
 
+9. ANSWERING INFORMATIONAL / HOW-TO QUESTIONS:
+   - If the user asks an informational or how-to question ABOUT THE SHELL or about how to accomplish a terminal task (e.g. "how do I find files larger than 100MB?", "what's the command to count lines in a file?", "what does chmod 644 do?"), you MUST answer it and you MUST NOT execute anything.
+   - This is DIFFERENT from Rule 4 (irrelevant input): a how-to question about the shell IS relevant - you answer it, you do not reject it. Reserve Rule 4 for inputs unrelated to the terminal (e.g. "can pigs fly?").
+   - Native tool calling mode: call the `answer_question` tool. Put your explanation in `explanation`, and when a concrete command applies, put it in `suggested_command` (this command is SUGGESTED ONLY and is NOT executed). Do NOT call `execute_bash_command` for a how-to question, and do NOT generate `echo`/`printf` to print the answer.
+   - Non-tool-calling mode: respond with the fallback JSON block setting "executable": false, "rule_triggered": 9, "suggested_command" to the command the user could run, and "response_text" to your explanation. Do NOT set "executable": true for a how-to question.
+   - EXECUTING A PREVIOUSLY SUGGESTED COMMAND: if a prior answer turn in the conversation supplied a `suggested_command`, and the user now asks to run it (e.g. "execute it", "execute that", "run that", "go ahead", "yes do it"), you MUST run that exact suggested command - in native tool calling mode call `execute_bash_command` with it; in non-tool-calling mode output the JSON with "executable": true and "command" set to that suggested command. (It then passes through the normal filesystem-modification safety check.) Do NOT ask for clarification and do NOT substitute a different command.
+   - MODIFYING A SUGGESTION: if the user asks to change a previously suggested command (e.g. "modify it to do Y", "make it recursive"), produce a new answer (call `answer_question` again, or in non-tool-calling mode another Rule 9 JSON block) with the revised `suggested_command` - keep it a suggestion until the user asks to execute it.
+   - If the user asks to execute "it" but no prior turn supplied a suggested command, treat the request as a normal new instruction (or apply Rule 7's missing-context handling if it references nonexistent context).
+
 GENERAL WARNING ON TOOL USAGE:
    - You must never use tools (such as generating `echo` or `printf` commands) as a workaround to answer conversational questions, capability inquiries, irrelevant inputs, or safety/impossible prompts. If a prompt should not be executed as a command, you MUST NOT call the tool. Calling the tool for these requests is a critical system failure. You must return a JSON response directly containing the response_text.
 """
@@ -139,6 +148,20 @@ Guidelines:
 - Identify what is unspecified and ask about that - e.g. an attribute with several meanings (a date could mean creation, access, or modification time; "size" could mean file size or total disk usage), or a missing required detail (an action with no target, a move/copy with no destination).
 - Provide "options" only when there is a small, well-defined set of choices.
 - Exactly ONE question.
+"""
+
+ANSWER_HOWTO_PROMPT = """The user asked a HOW-TO question about using the shell (e.g. "how would I view all the executable files recursively?"). Your ONLY job is to ANSWER it. You do NOT execute anything, and you do NOT ask the user any questions.
+
+Respond with ONLY a raw JSON object and nothing else:
+{
+  "explanation": "a short, direct explanation of how to do it",
+  "suggested_command": "the single bash command the user could run to do it (empty \\"\\" only if no command applies)"
+}
+
+Rules:
+- ALWAYS answer directly. NEVER ask for clarification, and NEVER request more details - if something is unspecified (e.g. output format), just pick the most sensible default and explain it.
+- Put the actual command in "suggested_command". This command is SUGGESTED ONLY - it is not run.
+- Do NOT wrap the command in markdown, do NOT add backticks, do NOT add commentary outside the JSON.
 """
 
 MAX_CLARIFICATION_ROUNDS = 2

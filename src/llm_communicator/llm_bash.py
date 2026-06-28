@@ -13,12 +13,17 @@ from llm_communicator.backup_system_prompts import FALLBACK_SYSTEM_INSTRUCTION, 
 from llm_communicator.tools import (
     BashSafetyViolationError,
     BashCommandInput,
+    AnswerInput,
     execute_bash,
     ask_user_clarification,
+    is_howto_question,
+    answer_howto_question,
+    is_execute_suggestion_request,
     parse_json_response,
     is_openai_model,
     NO_ANSWER_SENTINEL,
     EXECUTE_TOOL_DEF,
+    ANSWER_TOOL_DEF,
     CLARIFY_TOOL_DEF,
 )
 
@@ -41,9 +46,9 @@ HISTORY_SYSYEM_INSTRUCTION = (
     "Decide if the new instruction refers to any previous commands. Return a JSON object with 'relevant_ids'.\n"
     "Rules:\n"
     "1. If the command specifies a new file name or action directly (e.g. 'create a file called klum'), it is completely independent. Return {\"relevant_ids\": []}.\n"
-    "2. If it refers to previous outputs/files/results, resolve references in chronological order, preferring the most recent match based on semantic and logical dependencies.\n"
-    "   - You MUST link only to the actual command turn that successfully executed the action (e.g., touch/mkdir/ls).\n"
-    "   - DO NOT link to empty commands (\"command\": \"\"), failed/cancelled turns, or warning rejections.\n"
+    "2. If it refers to previous outputs/files/results, OR asks to run/execute/modify a previously SUGGESTED command (e.g. 'execute that', 'run it', 'modify it to ...'), resolve references in chronological order, preferring the most recent match based on semantic and logical dependencies.\n"
+    "   - Link to the turn that actually performed the action (e.g. touch/mkdir/ls), OR - for an 'execute it' / 'run that' / 'modify it' style follow-up - to the answer turn whose 'Suggested (not executed)' command the user now wants to run or change.\n"
+    "   - DO NOT link to pure rejection/cancelled/warning turns - those that have BOTH an empty command AND no suggested command. A turn with a 'Suggested (not executed)' command IS a valid link target.\n"
     "3. SAFETY CHECK: If you can match two different previous commands that are not connected, choose the most recent one (the command with the larger ID).\n"
     "Note: The recent command history is presented below from most recent to oldest."
 )
@@ -116,17 +121,20 @@ class BashToolAgent:
         if not history_metadata:
             return []
 
-        # Filter out turns that did not execute any command (empty command)
-        history_metadata = [t for t in history_metadata if t.get("command")]
+        # Keep turns that either executed a command OR proposed one via answer_question
+        # (suggested_command). Pure conversational/rejection turns carry neither and are
+        # not linkable. Answer turns must remain so "execute it"/"modify it" can refer back.
+        history_metadata = [t for t in history_metadata if t.get("command") or t.get("suggested_command")]
         if not history_metadata:
             return []
 
         # Quick heuristic check for independent instructions to assist small models
         instruction_lower = instruction.lower()
         context_indicators = [
-            "it", "them", "that", "those", "this", "these", "like", "mean", "meant", "the command", 
+            "it", "them", "that", "those", "this", "these", "like", "mean", "meant", "the command",
             "the output", "the results", "re-run", "recursively", "again", "previous", "we just", "before",
-            "output", "results", "we listed", "we created", "we did", "we ran", "we made", "above", "how many"
+            "output", "results", "we listed", "we created", "we did", "we ran", "we made", "above", "how many",
+            "execute", "run it", "run that", "modify", "do it"
         ]
         has_context_indicator = False
         for indicator in context_indicators:
@@ -144,6 +152,7 @@ class BashToolAgent:
 
         formatted_history = "\n".join([
             f"- [ID: {t['id']}] Prompt: \"{t['prompt']}\" | Command: \"{t['command']}\""
+            + (f" | Suggested (not executed): \"{t['suggested_command']}\"" if t.get("suggested_command") else "")
             for t in reversed(history_metadata)
         ])
 
@@ -265,19 +274,74 @@ class BashToolAgent:
 
         return True, explanation
 
+    def _execute_with_confirmation(self, command: str) -> str:
+        """
+        Run a command through the two safety layers: the LLM filesystem-modification judge
+        (asks the user for [y/N] before a modifying command) and the regex blacklist inside
+        execute_bash. Returns the execution output (or a cancelled/error marker). Shared by the
+        deterministic "execute that" route so suggestions get the same safety treatment as
+        model-generated commands.
+        """
+        try:
+            modifies, filter_explanation = self._filter_bash(command)
+            if modifies:
+                print(f"This command will modify your file system: {filter_explanation}")
+                user_choice = input("Do you want to continue? [y/N]: ").strip().lower()
+                if user_choice not in ('y', 'yes'):
+                    return "[Cancelled: User declined to execute command that modifies the file system]"
+            return execute_bash(command)
+        except BashSafetyViolationError as safety_err:
+            return f"[Error: {str(safety_err)}]"
+        except Exception as e:
+            return f"[Error: {str(e)}]"
+
     def _build_tools(self, include_clarification: bool) -> List[Dict[str, Any]]:
         """
         Tools offered to the generator. The clarification tool is withdrawn on the final round
-        so the model must commit to a command instead of asking again.
+        so the model must commit to a command (or an answer) instead of asking again.
         """
         if include_clarification:
-            return [EXECUTE_TOOL_DEF, CLARIFY_TOOL_DEF]
-        return [EXECUTE_TOOL_DEF]
+            return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF, CLARIFY_TOOL_DEF]
+        return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF]
 
     def run_single(self, instruction: str) -> None:
         """
         Coordinates a single user query execution.
         """
+        # 0. Deterministic how-to route (fallback mode only). Weak non-tool-calling models cannot
+        # reliably CLASSIFY a how-to question (they mis-route it to clarification), but they can
+        # ANSWER one. So we detect the how-to phrasing in Python and hand it to a focused, single
+        # purpose sub-call - no multi-rule prompt, no clarification machinery to copy. The answer
+        # is persisted with its suggested_command so a later "execute that" can run it. Native
+        # tool-calling models route this correctly via Rule 9, so they keep that path.
+        if not self.tool_calling and is_howto_question(instruction):
+            explanation, suggested = answer_howto_question(instruction)
+            _debug("HOWTO route:", repr(explanation), "| suggested:", repr(suggested))
+            print(explanation)
+            if suggested:
+                print(f"\nSuggested command (not executed): {suggested}")
+            history_manager.append_history_turn(
+                instruction, "", explanation, [], suggested_command=suggested
+            )
+            return
+
+        # 0b. Deterministic "execute that" route (fallback mode only). The weak model often
+        # returns empty or mislabels a request to run a previously suggested command, so we
+        # resolve it ourselves: pull the most recent suggested_command from history and run it
+        # through the SAME safety pipeline. Only fires when such a suggestion exists; otherwise
+        # falls through to normal handling. Native tool-calling models handle this via Rule 9.
+        if not self.tool_calling and is_execute_suggestion_request(instruction):
+            found = history_manager.get_latest_suggested_command()
+            if found:
+                src_id, suggested = found
+                _debug("EXECUTE-SUGGESTION route: src_id=", src_id, "command=", repr(suggested))
+                print(f"[EXECUTING SUGGESTED] {suggested}")
+                output = self._execute_with_confirmation(suggested)
+                print(f"[RESULT] Shell Response:\n{output}")
+                history_manager.append_history_turn(instruction, suggested, output, [src_id])
+                return
+            _debug("EXECUTE-SUGGESTION route: no prior suggested_command; falling through")
+
         # 1. Fetch metadata for last 20 actions from history
         metadata = history_manager.get_history_metadata(limit=LLM_CONTEXT_LIMIT)
 
@@ -309,10 +373,11 @@ class BashToolAgent:
                 })
                 
                 command = turn.get("command", "")
+                suggested = turn.get("suggested_command", "")
                 output = turn.get("output", "")
                 if output and len(output) > 2000:
                     output = output[:2000] + "\n... [TRUNCATED due to length]"
-                
+
                 if command:
                     tool_call_id = f"call_{turn['id']}"
                     self.conversation_history.append({
@@ -335,6 +400,31 @@ class BashToolAgent:
                         "name": "execute_bash_command",
                         "content": output
                     })
+                elif suggested:
+                    # Replay an answer turn: the model proposed (but did not run) a command.
+                    # Surfacing it as the answer_question tool call lets a follow-up like
+                    # "execute it" re-emit it as execute_bash_command, or "modify it" revise it.
+                    tool_call_id = f"call_{turn['id']}"
+                    self.conversation_history.append({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "answer_question",
+                                "arguments": json.dumps({
+                                    "explanation": output,
+                                    "suggested_command": suggested
+                                })
+                            }
+                        }]
+                    })
+                    self.conversation_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": "answer_question",
+                        "content": "[Answer delivered to the user. Suggested command was NOT executed.]"
+                    })
                 else:
                     self.conversation_history.append({
                         "role": "assistant",
@@ -356,20 +446,21 @@ class BashToolAgent:
             for turn in relevant_turns:
                 prompt = turn["prompt"]
                 command = turn.get("command", "")
+                suggested = turn.get("suggested_command", "")
                 output = turn.get("output", "")
                 if output and len(output) > 2000:
                     output = output[:2000] + "\n... [TRUNCATED due to length]"
-                
+
                 if user_content:
                     user_content += f"\n\n{prompt}"
                 else:
                     user_content = prompt
-                    
+
                 self.conversation_history.append({
                     "role": "user",
                     "content": user_content
                 })
-                
+
                 if command:
                     assistant_json = {
                         "executable": True,
@@ -383,6 +474,23 @@ class BashToolAgent:
                         "content": json.dumps(assistant_json)
                     })
                     user_content = f"Command execution output:\n{output}"
+                elif suggested:
+                    # Replay an answer turn (Rule 9): the assistant explained and SUGGESTED a
+                    # command but did not run it. Surfacing the suggested_command lets a
+                    # follow-up "execute that" set executable:true with this command.
+                    assistant_json = {
+                        "executable": False,
+                        "command": "",
+                        "suggested_command": suggested,
+                        "explanation": "answered a how-to question; command suggested, not executed",
+                        "rule_triggered": 9,
+                        "response_text": output
+                    }
+                    self.conversation_history.append({
+                        "role": "assistant",
+                        "content": json.dumps(assistant_json)
+                    })
+                    user_content = ""
                 else:
                     self.conversation_history.append({
                         "role": "assistant",
@@ -402,6 +510,7 @@ class BashToolAgent:
 
         executed_command = ""
         execution_output = ""
+        suggested_command = ""
         clarifications_used = 0
         clar_log = []   # (question, answer) pairs, folded into the persisted prompt
         handled = False
@@ -497,6 +606,30 @@ class BashToolAgent:
                             "name": tool_call.function.name,
                             "content": execution_result
                         })
+                    elif tool_call.function.name == "answer_question":
+                        # Informational/how-to reply: explain and (optionally) suggest a command
+                        # WITHOUT executing it. The suggestion is persisted so a later
+                        # "execute it" can resolve and run it.
+                        try:
+                            args_data = json.loads(tool_call.function.arguments)
+                            answer_input = AnswerInput(**args_data)
+                            suggested_command = answer_input.suggested_command
+                            print(answer_input.explanation)
+                            if answer_input.suggested_command:
+                                print(f"\nSuggested command (not executed): {answer_input.suggested_command}")
+                            execution_output = answer_input.explanation
+                            tool_result = "[Answer delivered to the user. Suggested command was NOT executed.]"
+                        except Exception as e:
+                            tool_result = f"[Error: Failed to process answer tool arguments: {str(e)}]"
+                            print(tool_result)
+                            execution_output = tool_result
+
+                        self.conversation_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": tool_result
+                        })
                 handled = True
 
             elif not self.tool_calling and assistant_message.content:
@@ -506,6 +639,7 @@ class BashToolAgent:
                     parsed = parse_json_response(content)
                     _debug("fallback parsed =", parsed)
                     command = parsed.get("command", "")
+                    suggested_command = parsed.get("suggested_command", "") or ""
                     explanation = parsed.get("explanation", "")
                     response_text = parsed.get("response_text", "")
                     if not response_text:
@@ -533,12 +667,16 @@ class BashToolAgent:
                     continue
 
                 if not executable:
+                    # A Rule 9 answer carries a suggested_command (not executed); persist it so a
+                    # later "execute that" can resolve and run it. Rejections carry neither.
+                    if suggested_command:
+                        print(f"\nSuggested command (not executed): {suggested_command}")
                     if response_text:
                         print(response_text)
-                        history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", response_text, llm_relevant_ids)
+                        history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", response_text, llm_relevant_ids, suggested_command=suggested_command)
                     elif content:
                         print(content)
-                        history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", content, llm_relevant_ids)
+                        history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", content, llm_relevant_ids, suggested_command=suggested_command)
                     return
 
                 executed_command = command
@@ -588,10 +726,19 @@ class BashToolAgent:
                     execution_output = assistant_message.content
                 handled = True
             else:
-                print("Error Unknown")
-                execution_output = "Error Unknown"
-                handled = True
+                # The model returned no tool call and no content (weak local models sometimes
+                # emit an empty completion). Don't persist a junk "Error Unknown" turn that would
+                # pollute later reference resolution - report and stop without recording it.
+                _debug("BRANCH: empty model response (no tool_calls, no content)")
+                print("Sorry, I couldn't produce a response for that. Please rephrase or try again.")
+                return
 
         # Log new turn to history
-        if executed_command or execution_output:
-            history_manager.append_history_turn(_persist_prompt(instruction, clar_log), executed_command, execution_output, llm_relevant_ids)
+        if executed_command or execution_output or suggested_command:
+            history_manager.append_history_turn(
+                _persist_prompt(instruction, clar_log),
+                executed_command,
+                execution_output,
+                llm_relevant_ids,
+                suggested_command=suggested_command,
+            )
