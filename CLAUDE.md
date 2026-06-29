@@ -73,7 +73,9 @@ There are **two independent safety layers**: the LLM filesystem-modification jud
 
 ### History / sessions
 
-Sessions are isolated per shell by **PPID**. History is a JSONL file at `<project_root>/.doit/history_<ppid>.jsonl`, where project root is found by walking up for `.git`/`pyproject.toml`/`doit.cfg`/`.doit`. The launcher exports `DOIT_PPID` so the session survives across `uv run` invocations. Each turn has an incrementing `id` and a `relevant_ids` list that forms the dependency graph used by reference resolution.
+Sessions are isolated per shell. Each session has a folder `<repo>/.doit/history_<pid>/` (install-relative, not cwd-relative) holding `doit.jsonl` (doit's own turns) and `cmdlog.tsv` (the user's terminal commands + exit status, written by the shell recorder hook). The **shell** (`doit-init.sh`) owns the folder — it names it from its own `$$` and points `DOIT_CMD_LOG` into it; `history_manager.get_history_file_path()` then **follows** that folder via `dirname(DOIT_CMD_LOG)` rather than recomputing a PID. This matters because the launcher's `DOIT_PPID` (from `$PPID`) does **not** always equal the shell's `$$` — notably in the VS Code integrated terminal — so deriving the folder independently on each side would split `doit.jsonl` from `cmdlog.tsv`. Without shell integration, it falls back to `.doit/history_<DOIT_PPID or getppid>/doit.jsonl`. Each turn has an incrementing `id` and a `relevant_ids` list forming the dependency graph used by reference resolution.
+
+**Output awareness:** doit answers questions about a previous command's output. For its own commands the output is in history; for commands the *user* ran (only command + exit status are stored, never output), Rule 11 directs the model to **re-run/pipe** the command to obtain the data when it succeeded and is safe to repeat. Rule 10 defines attribution defaults (you/we → doit's last action; I → user's last; bare reference → most recent).
 
 ### Launcher (`src/doit`)
 

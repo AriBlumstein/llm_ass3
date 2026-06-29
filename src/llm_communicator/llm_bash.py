@@ -61,6 +61,7 @@ HISTORY_SYSYEM_INSTRUCTION = (
     "   - DO NOT link to pure rejection/cancelled/warning turns - those that have BOTH an empty command AND no suggested command. A turn with a 'Suggested (not executed)' command IS a valid link target.\n"
     "   - A turn marked '(the USER ran this directly)' is a command the user ran themselves in the terminal; it IS a valid link target. For example, if the user manually ran 'touch klum' and now says 'delete the file I just made', link to that user turn.\n"
     "3. SAFETY CHECK: If you can match two different previous commands that are not connected, choose the most recent one (the command with the larger ID).\n"
+    "4. ATTRIBUTION DEFAULTS for an unqualified reference: a bare reference with no 'I'/'you' (e.g. 'the previous command', 'that', 'why did that fail', 're-run that') -> the MOST RECENT command (largest ID), whether the user ran it or doit did. 'what did you/we just do' (you/we) -> the most recent DOIT command. 'the command I just did/ran' (I) -> the most recent command marked '(the USER ran this directly)'.\n"
     "Note: The recent command history is presented below from most recent to oldest."
 )
 
@@ -163,6 +164,9 @@ class BashToolAgent:
             "the file", "the folder", "the directory", "the dir",
             # "what did you/I just do" style questions about the most recent action
             "you just", "did you", "did i", "just do", "what did",
+            # output-awareness questions ABOUT a previous command's output/result/failure
+            "safe to", "why did", "what was", "what does", "error", "fail", "failed", "biggest",
+            "largest", "smallest",
         ]
         has_context_indicator = False
         for indicator in context_indicators:

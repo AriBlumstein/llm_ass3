@@ -23,17 +23,23 @@ _DOIT_LAUNCHER="$(cd "$(dirname "$_DOIT_SELF")" && pwd)/doit"
 unset _DOIT_SELF
 
 # --- User-command recorder (accurate success/failure for user awareness) ---------------------------
-# A per-command hook logs "<exit status>\t<command>" to a per-session file, so doit knows not just
+# A per-command hook logs "<exit status>\t<command>" to this session's cmdlog, so doit knows not just
 # WHAT you ran in the terminal but whether it SUCCEEDED or FAILED (the shell history alone has no exit
 # status). doit reads this file via $DOIT_CMD_LOG; it falls back to `fc -l` (no exit status) if absent.
-if [ -z "${DOIT_CMD_LOG:-}" ]; then
-    _DOIT_REPO="$(cd "$(dirname "$_DOIT_LAUNCHER")/.." 2>/dev/null && pwd)"
-    if [ -n "$_DOIT_REPO" ]; then
-        mkdir -p "$_DOIT_REPO/.doit" 2>/dev/null
-        export DOIT_CMD_LOG="$_DOIT_REPO/.doit/cmdlog_$$.tsv"
-    fi
-    unset _DOIT_REPO
+#
+# Everything for one session lives in ONE folder, <repo>/.doit/history_<pid>/, holding cmdlog.tsv
+# (this hook) and doit's own doit.jsonl history (the Python side). Both sides key the folder off
+# DOIT_PPID, which we PIN here to THIS shell's $$. Pinning in the shell is what makes it robust: the
+# launcher would otherwise derive DOIT_PPID from $PPID, which is NOT this shell in some terminals
+# (notably VS Code), splitting the two files apart. Set both UNCONDITIONALLY (no [ -z ] guard) so a
+# stale DOIT_CMD_LOG inherited from a previous/older session is healed to this session's folder.
+export DOIT_PPID="$$"
+_DOIT_REPO="$(cd "$(dirname "$_DOIT_LAUNCHER")/.." 2>/dev/null && pwd)"
+if [ -n "$_DOIT_REPO" ]; then
+    mkdir -p "$_DOIT_REPO/.doit/history_$DOIT_PPID" 2>/dev/null
+    export DOIT_CMD_LOG="$_DOIT_REPO/.doit/history_$DOIT_PPID/cmdlog.tsv"
 fi
+unset _DOIT_REPO
 
 # Pairing the command TEXT with its exit STATUS needs the preexec pattern: capture the command just
 # BEFORE it runs (so we have its text), then log it with $? just AFTER (the prompt hook). Doing it the

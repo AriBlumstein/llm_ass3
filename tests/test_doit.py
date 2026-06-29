@@ -75,6 +75,11 @@ def isolate_history(tmp_path, monkeypatch):
     # one, and every BashToolAgent constructed in tests sees an empty store unless it adds memories.
     mem_file = tmp_path / "test_memories.json"
     monkeypatch.setattr(memory_manager, "get_memory_file_path", lambda: mem_file)
+    # Clear the shell-integration env vars by default so tests don't pick up the developer's REAL
+    # recorded commands / session folder (set when doit-init.sh is sourced in the test runner's
+    # shell). Tests that exercise these set them explicitly via monkeypatch.setenv.
+    for _var in ("DOIT_CMD_LOG", "DOIT_PPID", "DOIT_SHELL_HISTORY"):
+        monkeypatch.delenv(_var, raising=False)
 
 
 # =====================================================================
@@ -2133,3 +2138,126 @@ def test_cmd_log_preferred_over_fc_history(mock_load_config, monkeypatch, tmp_pa
     agent._sync_user_history()
     cmds = [t["command"] for t in history_manager.get_history_metadata() if t["source"] == "user"]
     assert cmds == ["mkdir data"]   # from the log, not the fc history
+
+
+# =====================================================================
+# SECTION: Session folder (cmdlog + doit history co-located, PID-mismatch-proof)
+# =====================================================================
+def test_history_in_pid_folder_named_by_doit_ppid(monkeypatch):
+    """doit's history lives in `.doit/history_<DOIT_PPID>/doit.jsonl`, named by the shell-pinned
+    DOIT_PPID. It is ALWAYS pid-named (never a bare shared `.doit/doit.jsonl`) and does NOT depend on
+    DOIT_CMD_LOG, so a stale/odd DOIT_CMD_LOG can't move or un-isolate it."""
+    from llm_communicator import history_manager
+    monkeypatch.undo()   # restore the real get_history_file_path (autouse patched it to a tmp file)
+    monkeypatch.setenv("DOIT_PPID", "sess777")
+    monkeypatch.setenv("DOIT_CMD_LOG", "/somewhere/else/cmdlog_999.tsv")   # deliberately elsewhere
+    fp = history_manager.get_history_file_path()
+    try:
+        assert fp.name == "doit.jsonl"
+        assert fp.parent.name == "history_sess777"   # from DOIT_PPID, NOT dirname(DOIT_CMD_LOG)
+        assert fp.parent.parent.name == ".doit"
+    finally:
+        try:
+            fp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_history_pid_folder_falls_back_to_getppid(monkeypatch):
+    """With nothing exporting DOIT_PPID (bare run), the folder is still PID-named via os.getppid() -
+    so it is never a bare shared `.doit/doit.jsonl`."""
+    from llm_communicator import history_manager
+    monkeypatch.undo()
+    monkeypatch.delenv("DOIT_PPID", raising=False)
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    fp = history_manager.get_history_file_path()
+    try:
+        assert fp.name == "doit.jsonl"
+        assert fp.parent.name == f"history_{__import__('os').getppid()}"
+        assert fp.parent.parent.name == ".doit"
+    finally:
+        try:
+            fp.parent.rmdir()
+        except OSError:
+            pass
+
+
+# =====================================================================
+# SECTION: Output awareness via re-run (no output capture)
+# =====================================================================
+def test_system_prompt_output_awareness_rerun():
+    """Rule 11 tells the agent to RE-RUN an uncaptured (user) command to answer output questions."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    lowered = DOIT_SYSTEM_PROMPT.lower()
+    assert "output awareness" in lowered
+    assert "re-run" in lowered
+    assert "exit 0" in lowered
+    assert "read-only" in lowered
+
+
+def test_system_prompt_attribution_defaults():
+    """Rule 10 documents whose command an unqualified reference defaults to."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    lowered = DOIT_SYSTEM_PROMPT.lower()
+    assert "most recent command" in lowered
+    assert "you/we" in lowered     # you/we -> doit
+    assert "i just did" in lowered  # I -> user
+
+
+@pytest.mark.parametrize("text,subject", [
+    ("what did we just do", "doit"),
+    ("what did you just do", "doit"),
+    ("what did I just do", "user"),
+])
+def test_is_activity_query_we_maps_to_doit(text, subject):
+    from llm_communicator.tools import is_activity_query
+    assert is_activity_query(text) == subject
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@pytest.mark.parametrize("question", [
+    "which of these is safe to delete?",
+    "why did that fail?",
+    "what was the biggest one?",
+])
+def test_output_question_triggers_resolution(mock_completion, question):
+    """An output question about a previous command trips the context heuristic so the resolver runs
+    and links the relevant turn (rather than short-circuiting to [])."""
+    mock_completion.return_value = MockResponse(MockMessage(content='{"relevant_ids": [1]}'))
+    agent = BashToolAgent(api_key="fake-key")
+    metadata = [{"id": 1, "source": "user", "prompt": "", "command": "ls -lhS", "suggested_command": ""}]
+    ids = agent._analyze_references(question, metadata)
+    mock_completion.assert_called_once()
+    assert ids == [1]
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_output_question_reruns_user_command(mock_execute_bash, mock_completion):
+    """After a successful user command (output NOT captured), an output question replays the user's
+    command into context and the agent answers by RE-RUNNING / piping it (here the model builds on
+    `ls -lhS`)."""
+    from llm_communicator import history_manager
+    history_manager.append_history_turn(
+        "", "ls -lhS", BashToolAgent._user_cmd_output("0"), source="user", hist_n=1,
+    )
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    tool_call = MockToolCall("d1", "execute_bash_command",
+                             {"command": "ls -lhS | head -n 1", "explanation": "biggest"})
+    msg_filter = MockMessage(content="DECISION: NO")   # read-only -> no [y/N]
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(MockMessage(tool_calls=[tool_call])),
+        MockResponse(msg_filter),
+    ]
+    mock_execute_bash.return_value = "big.bin"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("which of these is biggest?")
+
+    # The user's command was replayed so the model could re-run it...
+    assert any("ls -lhS" in (m.get("content") or "") for m in agent.conversation_history)
+    # ...and the agent re-ran/built on it to answer (no output was ever captured).
+    mock_execute_bash.assert_called_once_with("ls -lhS | head -n 1")

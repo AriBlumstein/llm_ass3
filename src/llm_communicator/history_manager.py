@@ -22,20 +22,20 @@ def find_project_root() -> Path:
 
 def get_history_file_path() -> Path:
     """
-    Get the path to the history file for the current shell session (isolated by PPID).
+    doit's own history file for the current shell session: `<repo>/.doit/history_<pid>/doit.jsonl`,
+    co-located with the user-command `cmdlog.tsv` the shell recorder writes into the SAME folder.
 
-    Anchored to the INSTALL location (this module -> repo root), NOT the cwd. `cd` now persists, so
-    the working directory changes between invocations; a cwd-relative path (walking up from the cwd)
-    would scatter a single session's turns across multiple `.doit/` directories - breaking
-    reference resolution and making `-n` clear the wrong file. Install-relative keeps one session
-    (one PPID) in one file regardless of where doit is run from, co-located with memory under the
-    repo's `.doit/`.
+    The session `<pid>` is `DOIT_PPID`, which `doit-init.sh` PINS to the interactive shell's `$$`
+    (and the launcher then preserves). It MUST be pinned by the shell, not derived here: the
+    launcher's own `$PPID` is not always the interactive shell (e.g. the VS Code terminal), so we
+    take the id the shell exported. The folder is ALWAYS PID-named and install-relative, so sessions
+    never collide and a session's turns stay in one place regardless of the cwd. Falls back to
+    `os.getppid()` only when nothing exported `DOIT_PPID` (a bare run without shell integration).
     """
     ppid = os.environ.get("DOIT_PPID") or str(os.getppid())
-    repo_root = Path(__file__).resolve().parents[2]
-    history_dir = repo_root / ".doit"
-    history_dir.mkdir(parents=True, exist_ok=True)
-    return history_dir / f"history_{ppid}.jsonl"
+    session_dir = Path(__file__).resolve().parents[2] / ".doit" / f"history_{ppid}"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return session_dir / "doit.jsonl"
 
 def append_history_turn(prompt: str, command: str, output: str, relevant_ids: List[int] = None, suggested_command: str = "", source: str = "doit", hist_n: int = None) -> None:
     """

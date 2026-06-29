@@ -403,8 +403,8 @@ ACTIVITY_QUERY_PATTERNS = [
     (r"\bwhat\s+have\s+i\s+(done|run|been)\b", "user"),
     (r"\bremind\s+me\s+what\s+i\b", "user"),
     (r"\bmy\s+(recent|last|previous)\b.*\b(command|step|action|thing)", "user"),
-    (r"\bwhat\s+did\s+(you|doit)\b.*\b(do|run|just|execute)\b", "doit"),
-    (r"\bwhat\s+have\s+you\s+(done|run)\b", "doit"),
+    (r"\bwhat\s+did\s+(you|doit|we)\b.*\b(do|run|just|execute)\b", "doit"),
+    (r"\bwhat\s+have\s+(you|we)\s+(done|run)\b", "doit"),
     (r"\bwhat\s+just\s+happened\b", "both"),
     (r"\bwhat('?s| has)\s+been\s+(going\s+on|happening)\b", "both"),
     # "explain what you/I just did" / "explain that action" - explanation of a recent action
