@@ -24,6 +24,11 @@ from llm_communicator.tools import (
     resolve_session_state_hoist,
     is_memory_candidate,
     extract_memories,
+    parse_shell_history,
+    parse_cmd_log,
+    is_doit_invocation,
+    is_activity_query,
+    explain_command,
     parse_json_response,
     is_openai_model,
     NO_ANSWER_SENTINEL,
@@ -54,6 +59,7 @@ HISTORY_SYSYEM_INSTRUCTION = (
     "2. If it refers to previous outputs/files/results, OR asks to run/execute/modify a previously SUGGESTED command (e.g. 'execute that', 'run it', 'modify it to ...'), resolve references in chronological order, preferring the most recent match based on semantic and logical dependencies.\n"
     "   - Link to the turn that actually performed the action (e.g. touch/mkdir/ls), OR - for an 'execute it' / 'run that' / 'modify it' style follow-up - to the answer turn whose 'Suggested (not executed)' command the user now wants to run or change.\n"
     "   - DO NOT link to pure rejection/cancelled/warning turns - those that have BOTH an empty command AND no suggested command. A turn with a 'Suggested (not executed)' command IS a valid link target.\n"
+    "   - A turn marked '(the USER ran this directly)' is a command the user ran themselves in the terminal; it IS a valid link target. For example, if the user manually ran 'touch klum' and now says 'delete the file I just made', link to that user turn.\n"
     "3. SAFETY CHECK: If you can match two different previous commands that are not connected, choose the most recent one (the command with the larger ID).\n"
     "Note: The recent command history is presented below from most recent to oldest."
 )
@@ -136,9 +142,12 @@ class BashToolAgent:
             return []
 
         # Keep turns that either executed a command OR proposed one via answer_question
-        # (suggested_command). Pure conversational/rejection turns carry neither and are
-        # not linkable. Answer turns must remain so "execute it"/"modify it" can refer back.
-        history_metadata = [t for t in history_metadata if t.get("command") or t.get("suggested_command")]
+        # (suggested_command). Pure conversational/rejection turns carry neither and are not linkable.
+        # USER turns (commands the user ran directly) ARE included, so "delete the file I just made"
+        # can resolve to a file the user created manually - the strongest place to surface it is the
+        # replayed conversation, right next to the instruction.
+        history_metadata = [t for t in history_metadata
+                            if t.get("command") or t.get("suggested_command")]
         if not history_metadata:
             return []
 
@@ -148,7 +157,12 @@ class BashToolAgent:
             "it", "them", "that", "those", "this", "these", "like", "mean", "meant", "the command",
             "the output", "the results", "re-run", "recursively", "again", "previous", "we just", "before",
             "output", "results", "we listed", "we created", "we did", "we ran", "we made", "above", "how many",
-            "execute", "run it", "run that", "modify", "do it"
+            "execute", "run it", "run that", "modify", "do it",
+            # references to the user's own recent actions (user-awareness)
+            "i just", "i made", "i created", "i ran", "i deleted", "i removed", "i added",
+            "the file", "the folder", "the directory", "the dir",
+            # "what did you/I just do" style questions about the most recent action
+            "you just", "did you", "did i", "just do", "what did",
         ]
         has_context_indicator = False
         for indicator in context_indicators:
@@ -165,7 +179,9 @@ class BashToolAgent:
             return []
 
         formatted_history = "\n".join([
-            f"- [ID: {t['id']}] Prompt: \"{t['prompt']}\" | Command: \"{t['command']}\""
+            f"- [ID: {t['id']}] "
+            + ("(the USER ran this directly) " if t.get("source") == "user" else "")
+            + f"Prompt: \"{t['prompt']}\" | Command: \"{t['command']}\""
             + (f" | Suggested (not executed): \"{t['suggested_command']}\"" if t.get("suggested_command") else "")
             for t in reversed(history_metadata)
         ])
@@ -287,6 +303,134 @@ class BashToolAgent:
             return False, ""
 
         return True, explanation
+
+    @staticmethod
+    def _read_user_commands() -> List[tuple]:
+        """
+        The user's recent terminal commands as [(index, status, command)]. Prefers the exit-status log
+        (DOIT_CMD_LOG, written by the shell recorder - status is "0"/"N"); falls back to `fc -l` history
+        (DOIT_SHELL_HISTORY, status None). Empty when there is no shell integration.
+        """
+        log = os.environ.get("DOIT_CMD_LOG")
+        if log:
+            try:
+                with open(log, "r", encoding="utf-8") as f:
+                    entries = parse_cmd_log(f.read())
+                if entries:
+                    return entries
+            except Exception:
+                pass
+        raw = os.environ.get("DOIT_SHELL_HISTORY")
+        if raw:
+            return [(n, None, cmd) for n, cmd in parse_shell_history(raw)]
+        return []
+
+    @staticmethod
+    def _user_cmd_output(status) -> str:
+        """A synthetic 'output' for a user command, reflecting its real exit status when known. An
+        EMPTY output makes the model read the command as failed, so we always say what happened."""
+        if status is None:
+            return "[Ran by the user directly in the terminal; exit status not captured by doit.]"
+        s = str(status).strip()
+        if s == "0":
+            return "[Ran by the user directly in the terminal; completed successfully (exit 0). Output not captured by doit.]"
+        return f"[Ran by the user directly in the terminal; it FAILED (exit {s}). Output not captured by doit.]"
+
+    def _sync_user_history(self) -> None:
+        """
+        Import the user's manual shell commands into the per-session history as source="user" turns,
+        interleaved in order with doit's own turns. Uses the exit-status log when available (so user
+        commands carry real success/failure), else `fc -l`. De-dups via hist_n (only commands newer
+        than the high-water mark), drops `doit ...` invocation lines (already doit's own turns). Best
+        effort; no-op without shell integration.
+        """
+        entries = self._read_user_commands()
+        if not entries:
+            return
+        try:
+            last_seen = history_manager.get_last_user_hist_n()
+            for idx, status, cmd in entries:
+                if idx <= last_seen or is_doit_invocation(cmd):
+                    continue
+                history_manager.append_history_turn(
+                    prompt="", command=cmd, output=self._user_cmd_output(status),
+                    relevant_ids=[], source="user", hist_n=idx,
+                )
+        except Exception as e:
+            _debug("USER-HISTORY sync failed:", e)
+
+    def _activity_items(self, subject: str) -> List[Dict[str, Any]]:
+        """Recent command-bearing turns for the subject, with consecutive duplicates collapsed."""
+        recent = [t for t in history_manager.get_history_metadata(limit=20) if t.get("command")]
+        if subject == "user":
+            items = [t for t in recent if t.get("source") == "user"]
+        elif subject == "doit":
+            items = [t for t in recent if t.get("source") == "doit"]
+        else:
+            items = recent
+        # Collapse consecutive identical commands (e.g. the user ran `touch klum` several times).
+        deduped: List[Dict[str, Any]] = []
+        for t in items:
+            if deduped and deduped[-1]["command"] == t["command"] and deduped[-1].get("source") == t.get("source"):
+                continue
+            deduped.append(t)
+        return deduped
+
+    def _answer_activity_query(self, subject: str) -> str:
+        """
+        Answer a "what did I/you just do" question deterministically from the recent history (no LLM,
+        no command run). Correct attribution: the user's own commands are "you ran", doit's own
+        actions are "I ran".
+        """
+        lead = {"user": "Your most recent command was",
+                "doit": "My most recent action was"}.get(subject, "The most recent command was")
+        items = self._activity_items(subject)
+        if not items:
+            return "I don't have any recorded recent activity to report."
+
+        items = items[-6:]
+        out = [f"{lead}: {items[-1]['command']}"]
+        if len(items) > 1:
+            out.append("Recent activity (oldest to newest):")
+            for t in items:
+                who = "you ran" if t.get("source") == "user" else "I ran"
+                out.append(f"  - {who}: {t['command']}")
+        return "\n".join(out)
+
+    def _explain_recent_action(self, subject: str) -> str:
+        """Answer an 'explain what you/I just did' query: report the most recent command and explain
+        it via a focused sub-call (which cannot run anything)."""
+        items = self._activity_items(subject)
+        if not items:
+            return "I don't have a recent command to explain."
+        cmd = items[-1]["command"]
+        who = "You" if items[-1].get("source") == "user" else "I"
+        explanation = explain_command(cmd)
+        return f"{who} ran `{cmd}`." + (f" {explanation}" if explanation else "")
+
+    def _build_activity_block(self) -> str:
+        """
+        The user-awareness block injected into the system prompt: the CURRENT DIRECTORY plus a short,
+        ordered, tagged RECENT TERMINAL ACTIVITY list (both the user's manual commands and doit's own
+        actions). This is what lets the agent answer "what did I just do", ground commands in the cwd,
+        act on user-created files, and reason about what came last (undo).
+        """
+        try:
+            cwd = os.getcwd()
+        except Exception:
+            cwd = "(unknown)"
+        lines = [f"CURRENT DIRECTORY: {cwd}"]
+
+        recent = [t for t in history_manager.get_history_metadata(limit=15) if t.get("command")]
+        if recent:
+            lines.append(
+                "RECENT TERMINAL ACTIVITY (oldest first; [user] = the user ran it directly, "
+                "[doit] = doit ran it):"
+            )
+            for t in recent:
+                tag = "user" if t.get("source") == "user" else "doit"
+                lines.append(f"  [{tag}] {t['command']}")
+        return "\n".join(lines)
 
     def _store_memories(self, instruction: str, executed_command: str = "") -> None:
         """
@@ -421,6 +565,28 @@ class BashToolAgent:
         """
         Coordinates a single user query execution.
         """
+        # 0a. User awareness: import the user's manual shell commands (since the last turn) into the
+        # per-session history as source="user" turns, so doit is aware of what the user did directly
+        # and in what order relative to its own actions. Runs first, on every path.
+        self._sync_user_history()
+
+        # 0a-ii. Deterministic activity-query route (all modes). "what did I/you just do" is answered
+        # straight from the recorded history - no LLM, no command run - so a weak tool-calling model
+        # can't decide to RUN a command (e.g. `ls`) to "find out" instead of just reporting. Phrasings
+        # the regex misses fall through to the normal pipeline (prompt-guided).
+        activity_subject = is_activity_query(instruction)
+        if activity_subject is not None:
+            _debug("ACTIVITY-QUERY route:", activity_subject)
+            # "explain ..." wants an explanation of the recent command (focused sub-call); a plain
+            # "what did ..." wants a report (no LLM). Either way, no command is run to find out.
+            if "explain" in instruction.lower():
+                answer = self._explain_recent_action(activity_subject)
+            else:
+                answer = self._answer_activity_query(activity_subject)
+            print(answer)
+            history_manager.append_history_turn(instruction, "", answer, [])
+            return
+
         # 0. Deterministic how-to route (fallback mode only). Weak non-tool-calling models cannot
         # reliably CLASSIFY a how-to question (they mis-route it to clarification), but they can
         # ANSWER one. So we detect the how-to phrasing in Python and hand it to a focused, single
@@ -465,11 +631,18 @@ class BashToolAgent:
         # 3. Retrieve full records of identified relevant turns
         relevant_turns = history_manager.get_full_turns(relevant_ids)
 
-        # 4. Reconstruct conversation history starting with system prompt
+        # 4. Reconstruct conversation history starting with system prompt. Append the user-awareness
+        # block (current directory + recent terminal activity) to the system message - built per-run
+        # (after the sync) like the memory block, in the SYSTEM message only so history replay is
+        # undisturbed.
+        system_content = self.system_prompt
+        activity_block = self._build_activity_block()
+        if activity_block:
+            system_content += "\n\n" + activity_block
         self.conversation_history = [
             {
                 "role": "system",
-                "content": self.system_prompt
+                "content": system_content
             }
         ]
         
@@ -480,11 +653,21 @@ class BashToolAgent:
             self.conversation_history.extend(FEWSHOT_TOOLCALL)
 
             for turn in relevant_turns:
+                # A user turn is a command the user ran DIRECTLY in the terminal: replay it as a
+                # plain note (no doit tool call/result), so the agent treats it as the user's action.
+                # Include the "it ran" marker so the agent doesn't read empty output as a failure.
+                if turn.get("source") == "user":
+                    note = f"[I ran this command directly in the terminal]: {turn.get('command', '')}"
+                    if turn.get("output"):
+                        note += f"\n{turn['output']}"
+                    self.conversation_history.append({"role": "user", "content": note})
+                    continue
+
                 self.conversation_history.append({
                     "role": "user",
                     "content": turn["prompt"]
                 })
-                
+
                 command = turn.get("command", "")
                 suggested = turn.get("suggested_command", "")
                 output = turn.get("output", "")
@@ -557,6 +740,16 @@ class BashToolAgent:
 
             user_content = ""
             for turn in relevant_turns:
+                # A user turn (command the user ran directly) is folded into the running user_content
+                # so it stays right next to the instruction and never breaks user/assistant alternation.
+                # Include the "it ran" marker so empty output isn't read as a failure.
+                if turn.get("source") == "user":
+                    note = f"[I ran this command directly in the terminal]: {turn.get('command', '')}"
+                    if turn.get("output"):
+                        note += f"\n{turn['output']}"
+                    user_content = (user_content + "\n\n" + note) if user_content else note
+                    continue
+
                 prompt = turn["prompt"]
                 command = turn.get("command", "")
                 suggested = turn.get("suggested_command", "")

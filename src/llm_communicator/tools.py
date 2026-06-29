@@ -392,6 +392,109 @@ def resolve_cd_hoist(command: str) -> Optional[str]:
 SESSION_STATE_BUILTINS = ("export", "alias", "unalias", "set", "shopt", "unset", "pushd", "popd")
 
 
+# "What did I/you just do" style questions. Their answer is purely the recent history, so they are
+# handled deterministically (no LLM, no command run) - a weak model otherwise tends to RUN a command
+# (e.g. `ls`) to "find out" instead of just reporting. Patterns kept broad to cover common phrasings;
+# anything missed falls through to the normal pipeline (prompt-guided).
+ACTIVITY_QUERY_PATTERNS = [
+    # "what did I/you just do" + variants
+    (r"\bwhat\s+did\s+i\b.*\b(do|run|just|execute)\b", "user"),
+    (r"\b(summari[sz]e|recap)\b.*\bi\b", "user"),
+    (r"\bwhat\s+have\s+i\s+(done|run|been)\b", "user"),
+    (r"\bremind\s+me\s+what\s+i\b", "user"),
+    (r"\bmy\s+(recent|last|previous)\b.*\b(command|step|action|thing)", "user"),
+    (r"\bwhat\s+did\s+(you|doit)\b.*\b(do|run|just|execute)\b", "doit"),
+    (r"\bwhat\s+have\s+you\s+(done|run)\b", "doit"),
+    (r"\bwhat\s+just\s+happened\b", "both"),
+    (r"\bwhat('?s| has)\s+been\s+(going\s+on|happening)\b", "both"),
+    # "explain what you/I just did" / "explain that action" - explanation of a recent action
+    (r"\bexplain\b.*\bwhat\s+i\b", "user"),
+    (r"\bexplain\b.*\b(the|that|this)\s+command\s+i\b", "user"),
+    (r"\bi\s+just\s+(ran|performed|did)\b.*\bexplain\b", "user"),
+    (r"\bexplain\b.*\bwhat\s+you\b", "doit"),
+    (r"\bexplain\b.*\b(that|this|the)\s+(action|command)\b", "both"),
+]
+
+
+def is_activity_query(instruction: str) -> Optional[str]:
+    """
+    If the instruction asks what was recently done (or to explain a recent action), return whose
+    activity it concerns ("user", "doit", or "both"); else None. Deterministic, so these are handled
+    from history rather than by running a command (which weak models tend to do).
+    """
+    text = (instruction or "").lower()
+    for pat, subject in ACTIVITY_QUERY_PATTERNS:
+        if re.search(pat, text):
+            return subject
+    return None
+
+
+def explain_command(command: str) -> str:
+    """
+    Focused sub-call that explains what a shell command does, in 1-2 sentences. Used for
+    "explain what you/I just did" - more reliable on a weak model than the main multi-rule agent
+    (and it cannot run anything, just returns text). Empty string on failure.
+    """
+    if not command:
+        return ""
+    model_name, api_base, tool_calling = load_config()
+    completion_params = {
+        "model": model_name,
+        "api_base": api_base,
+        "messages": [
+            {"role": "system", "content": "You explain shell commands concisely for a user who wants to understand them. Reply with ONLY a 1-2 sentence explanation, no preamble, no markdown."},
+            {"role": "user", "content": f"Explain what this command does: {command}"},
+        ],
+    }
+    if not tool_calling and not is_openai_model(model_name):
+        completion_params["num_ctx"] = CTX_NUM
+    try:
+        response = litellm.completion(**completion_params)
+        return (response.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+
+def parse_shell_history(raw: str) -> List[tuple]:
+    """
+    Parse `fc -l` output (e.g. "  501  cd ~/x") into [(index, command), ...]. Used to import the
+    user's recent terminal commands (DOIT_SHELL_HISTORY) for user-awareness. Format is normalized by
+    `fc -l` across bash and zsh, so a single regex handles both.
+    """
+    pairs = []
+    for line in (raw or "").splitlines():
+        m = re.match(r"^\s*(\d+)\s+(.*)$", line)
+        if m:
+            cmd = m.group(2).strip()
+            if cmd:
+                pairs.append((int(m.group(1)), cmd))
+    return pairs
+
+
+def parse_cmd_log(raw: str) -> List[tuple]:
+    """
+    Parse the per-command exit-status log (each line '<exit status>\\t<command>', written by the
+    doit shell recorder) into [(line_index, status, command), ...]. line_index is the de-dup key.
+    """
+    out = []
+    for i, line in enumerate((raw or "").splitlines(), 1):
+        if "\t" in line:
+            status, cmd = line.split("\t", 1)
+            cmd = cmd.strip()
+            if cmd:
+                out.append((i, status.strip(), cmd))
+    return out
+
+
+def is_doit_invocation(command: str) -> bool:
+    """
+    True for a `doit ...` line in the user's shell history (the user invoking the agent). These are
+    already represented by doit's own turns, so they are excluded from imported user commands to
+    avoid double-counting.
+    """
+    return bool(re.match(r"^\s*doit(\s|$)", command or ""))
+
+
 def resolve_session_state_hoist(command: str) -> Optional[str]:
     """
     If `command` is a SINGLE session-state builtin invocation (export/alias/set/unset/shopt/pushd/

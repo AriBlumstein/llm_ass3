@@ -37,12 +37,16 @@ def get_history_file_path() -> Path:
     history_dir.mkdir(parents=True, exist_ok=True)
     return history_dir / f"history_{ppid}.jsonl"
 
-def append_history_turn(prompt: str, command: str, output: str, relevant_ids: List[int] = None, suggested_command: str = "") -> None:
+def append_history_turn(prompt: str, command: str, output: str, relevant_ids: List[int] = None, suggested_command: str = "", source: str = "doit", hist_n: int = None) -> None:
     """
     Appends a new conversation/execution turn to the session history.
 
     `suggested_command` holds a command that was proposed by an `answer_question` turn but
     NOT executed, so a later "execute it" follow-up can resolve and run it.
+
+    `source` is "doit" for the agent's own turns, or "user" for a command the user ran DIRECTLY in
+    the terminal (synced from shell history). `hist_n` is the shell-history index of a user command
+    (the de-dup high-water mark); it is None for doit turns.
     """
     path = get_history_file_path()
 
@@ -60,15 +64,41 @@ def append_history_turn(prompt: str, command: str, output: str, relevant_ids: Li
 
     turn = {
         "id": next_id,
+        "source": source,
+        "hist_n": hist_n,
         "prompt": prompt,
         "command": command,
         "suggested_command": suggested_command,
         "output": output,
         "relevant_ids": relevant_ids if relevant_ids is not None else []
     }
-    
+
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(turn) + "\n")
+
+
+def get_last_user_hist_n() -> int:
+    """
+    The highest shell-history index (`hist_n`) among already-imported `source:"user"` turns, or 0.
+    Used as the de-dup high-water mark when syncing the user's recent shell commands - we only import
+    commands with a higher index. Lives in the history itself, so `clear_history` resets it.
+    """
+    path = get_history_file_path()
+    if not path.exists():
+        return 0
+    last = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                turn = json.loads(line)
+                if turn.get("source") == "user" and isinstance(turn.get("hist_n"), int):
+                    last = max(last, turn["hist_n"])
+    except Exception:
+        return 0
+    return last
 
 def get_history_metadata(limit: int = 10) -> List[Dict[str, Any]]:
     """
@@ -89,6 +119,7 @@ def get_history_metadata(limit: int = 10) -> List[Dict[str, Any]]:
                 turn = json.loads(line)
                 metadata.append({
                     "id": turn["id"],
+                    "source": turn.get("source", "doit"),
                     "prompt": turn["prompt"],
                     "command": turn["command"],
                     "suggested_command": turn.get("suggested_command", "")

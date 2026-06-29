@@ -1,0 +1,153 @@
+// Doit Agent Context: Tool Use Scenario (Multi-Turn Stage 5 - user awareness)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = true).
+// Stage 5 carries over everything from Stage 4 (persistent memory; shell-state persistence; BashFilter
+// vetting hoisted commands) and adds USER AWARENESS: doit becomes aware of commands the USER runs
+// DIRECTLY in the terminal - not just its own - including their exit status.
+//
+//   (sync, no LLM) A shell recorder hook (in doit-init.sh: bash DEBUG trap + PROMPT_COMMAND, or zsh
+//       preexec/precmd) logs each user command AND its exit status to <repo>/.doit/cmdlog_<pid>.tsv
+//       (env DOIT_CMD_LOG; falls back to `fc -l` history with no status). At the TOP of each turn doit
+//       imports the new ones into the per-session history as source="user" turns - interleaved in
+//       order with its own source="doit" turns, each carrying a "completed (exit 0)" / "FAILED (exit
+//       N)" marker. Deterministic; not an LLM context.
+//   The main agent's system prompt now ALSO carries a CURRENT DIRECTORY + RECENT TERMINAL ACTIVITY
+//       block (tagged [user]/[doit]) and a new Rule 10, so it can answer "what I just did", ground
+//       commands in the cwd, act on files the USER created, and reason about what came last (undo).
+//   User turns are now LINK-ELIGIBLE in the resolver and REPLAYED in the conversation, so a reference
+//       like "delete the file I just made" resolves to a file the USER created manually.
+//   A deterministic ACTIVITY-QUERY route handles "what did I/you just do" (answered straight from
+//       history, no LLM, no command run) and "explain ..." (a focused ExplainCommand sub-call) - so a
+//       weak model can't decide to RUN a command (e.g. `ls`) just to report what happened.
+//
+// Per user turn @T the LLM contexts are, in order:
+//   0) ExplainCommand            - explains a recent command for an "explain ..." activity query    (NEW)
+//   1) HistoryReferenceResolver  - picks relevant prior turns; now links USER turns too             (CHANGED)
+//   2) DoitToolUseAgent          - generates/answers/clarifies; now memory- AND activity-aware       (CHANGED)
+//   3) ClarificationAuthor       - authors the clarifying question                                  (unchanged)
+//   4) BashFilter                - judges filesystem modification; vets hoisted commands too         (unchanged vs Stage 4)
+//   5) MemoryManager             - stores/updates/deletes durable memories after the turn            (unchanged vs Stage 4)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Convention: index < @T = prior turn.
+
+
+// 0. ExplainCommand (explain_command) - NEW in Stage 5.
+//    The deterministic activity-query route (is_activity_query) fires before the pipeline. For a
+//    "what did I/you just do" REPORT it answers straight from history (no LLM, not shown here). For an
+//    "explain ..." query it calls this focused sub-call to explain the most recent matching command -
+//    more reliable on a weak model than the main agent, and it cannot run anything. Then DONE.
+ExplainCommand[@T]: {
+    S: {
+        sys.explain_command_prompt
+    }
+
+    U: sys.pid.most_recent_command[@T]          // the most recent [user] or [doit] command to explain
+}
+
+
+// 1. HistoryReferenceResolver (_analyze_references) - CHANGED vs Stage 4.
+//    One user message: the new instruction plus prior history as metadata only. CHANGED: the metadata
+//    now carries `source` and USER turns are eligible link targets, so "delete the file I just made"
+//    can resolve to a command the user ran manually. The system prompt marks a user turn "(the USER
+//    ran this directly)". Still skipped (no LLM context) when there is no contextual indicator.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // CHANGED: a "(the USER ran this directly)" turn is a valid link target
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]   // fields now: [id, source, prompt, command, suggested_command]; turns with a command OR suggested_command (incl. user turns)
+    }
+}
+
+
+// 2. DoitToolUseAgent - CHANGED vs Stage 4.
+//    Same as Stage 4, but the system prompt ALSO carries the USER-AWARENESS block (current directory +
+//    recent [user]/[doit] activity), and the replayed history has a new branch for USER turns.
+DoitToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // now includes Rule 10 (environment/user awareness; pronoun attribution)
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]                // memory (Stage 4)
+        }
+        sys.activity_block[@T]                  // NEW: "CURRENT DIRECTORY: ... / RECENT TERMINAL ACTIVITY ([user]=ran directly, [doit]=run by doit)"; built per-run after the sync
+        sys.tools_definition
+    }
+
+    ForEach(@d: sys.fewshot_toolcall) {
+        U: sys.fewshot_toolcall[@d].instruction
+        A: sys.fewshot_toolcall[@d].tool_call
+        T: sys.fewshot_toolcall[@d].result
+    }
+
+    // Replayed relevant history. CHANGED: a USER turn (a command the user ran directly) replays as a
+    // plain note carrying its command and "it ran"/"FAILED" output - NOT as a doit tool call.
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids) {
+        If(sys.pid.turn[@t].source == "user") {
+            U: user_ran_note(sys.pid.turn[@t].command, sys.pid.turn[@t].output)   // NEW: "[I ran this directly in the terminal]: <command>\n<completed/FAILED marker>"
+        } Else {
+            U: sys.pid.turn[@t].prompt
+            If(sys.pid.turn[@t].command != "") {
+                A: sys.pid.tool_call[@t]
+                T: sys.pid.turn[@t].output
+            } Else {
+                If(sys.pid.turn[@t].suggested_command != "") {
+                    A: sys.pid.answer_call[@t]
+                    T: sys.answer_delivered_notice
+                } Else {
+                    A: sys.pid.turn[@t].output
+                }
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    ForEach(i: pid.clarification_steps[@T]) {
+        If(resp.pid.doit_tool_use_agent[@T.i].asks_clarification) {
+            A: resp.pid.doit_tool_use_agent[@T.i].ask_user_clarification_call
+            T: env.user_clarification_answer[@T.i]
+        }
+    }
+    // Terminal action: execute_bash_command (-> BashFilter, then hoisted if cd/session-state else run);
+    // answer_question (terminal); or plain text (e.g. a conversational answer about recent activity).
+}
+
+
+// 3. ClarificationAuthor (_author_clarification) - unchanged.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 4. BashFilter (_filter_bash) - unchanged from Stage 4 (vets every command, hoisted or not).
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction
+        resp.pid.doit_tool_use_agent[@T].tool_call[0].command   // the final execute_bash_command (hoisted or not)
+    }
+}
+
+
+// 5. MemoryManager (extract_memories) - unchanged from Stage 4.
+//    Gated by is_memory_candidate; stores/updates/deletes durable memories in <repo>/.doit/memories.json.
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_tool_use_agent[@T].command
+        sys.memories[@T]
+    }
+}

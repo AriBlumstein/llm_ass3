@@ -390,8 +390,8 @@ def test_history_manager_basic_operations(tmp_path, monkeypatch):
     # Verify metadata (outputs omitted)
     metadata = history_manager.get_history_metadata()
     assert len(metadata) == 2
-    assert metadata[0] == {"id": 1, "prompt": "list files", "command": "ls", "suggested_command": ""}
-    assert metadata[1] == {"id": 2, "prompt": "show process", "command": "ps", "suggested_command": ""}
+    assert metadata[0] == {"id": 1, "source": "doit", "prompt": "list files", "command": "ls", "suggested_command": ""}
+    assert metadata[1] == {"id": 2, "source": "doit", "prompt": "show process", "command": "ps", "suggested_command": ""}
     
     # Verify full turns retrieval
     full_turns = history_manager.get_full_turns([1])
@@ -553,55 +553,55 @@ def test_find_project_root(tmp_path, monkeypatch):
     assert resolved == root_dir.resolve()
 
 
-def test_cli_new_resets_history(tmp_path, monkeypatch):
-    """Verify that 'doit -n' or 'doit --new' clears history and exits cleanly."""
+def test_cli_new_alone_resets_history(monkeypatch):
+    """`doit -n` (no instruction) clears history and exits cleanly - no instruction required."""
     from doit_module.__main__ import main
     from llm_communicator import history_manager
 
-    # Write some history
     history_manager.append_history_turn("list files", "ls", "file1\nfile2", relevant_ids=[])
     assert len(history_manager.get_history_metadata()) == 1
 
-    # Mock sys.argv to run `doit -n` without instructions
     monkeypatch.setattr(sys, "argv", ["doit", "-n"])
 
-    # Mock sys.exit to raise SystemExit
     def mock_exit(code):
         raise SystemExit(code)
     monkeypatch.setattr(sys, "exit", mock_exit)
-
-    # Mock print to avoid stdout noise
     print_mock = MagicMock()
     monkeypatch.setattr("builtins.print", print_mock)
 
     with pytest.raises(SystemExit) as excinfo:
         main()
 
-    # History should be cleared
-    assert len(history_manager.get_history_metadata()) == 0
+    assert history_manager.get_history_metadata() == []
     assert excinfo.value.code == 0
     print_mock.assert_any_call("Session history cleared and new session started.")
 
 
-def test_cli_no_args_prints_help(monkeypatch):
-    """Verify that 'doit' with no args prints help and exits with error code 1."""
+@patch("doit_module.__main__.ensure_shell_integration")
+@patch.object(BashToolAgent, "run_single")
+def test_cli_new_with_instruction_resets_and_runs(mock_run_single, mock_integration, monkeypatch):
+    """`doit -n "<instruction>"` clears history (force_new) and then runs the instruction."""
     from doit_module.__main__ import main
+    from llm_communicator import history_manager
 
+    history_manager.append_history_turn("list files", "ls", "file1\nfile2", relevant_ids=[])
+    monkeypatch.setattr(sys, "argv", ["doit", "-n", "show me my files"])
+    main()
+
+    assert history_manager.get_history_metadata() == []
+    mock_run_single.assert_called_once_with("show me my files")
+
+
+def test_cli_no_args_errors_required_argument(monkeypatch, capsys):
+    """`doit` with no instruction now errors via argparse (required argument), exit code 2."""
+    from doit_module.__main__ import main
     monkeypatch.setattr(sys, "argv", ["doit"])
-
-    def mock_exit(code):
-        raise SystemExit(code)
-    monkeypatch.setattr(sys, "exit", mock_exit)
-
-    import argparse
-    help_mock = MagicMock()
-    monkeypatch.setattr(argparse.ArgumentParser, "print_help", help_mock)
 
     with pytest.raises(SystemExit) as excinfo:
         main()
 
-    help_mock.assert_called_once()
-    assert excinfo.value.code == 1
+    assert excinfo.value.code == 2                       # argparse's "missing required argument"
+    assert "instruction" in capsys.readouterr().err
 
 
 def test_history_system_instruction_rules():
@@ -1780,3 +1780,356 @@ def test_history_preserved_with_memory_injected(mock_execute_bash, mock_completi
     assert md[-1]["command"] == "ls -S"
     full = history_manager.get_full_turns([2])
     assert full[0]["output"] == "file2\nfile1"
+
+
+# =====================================================================
+# SECTION: User awareness (recent user shell commands + unified ordering)
+# =====================================================================
+
+def test_parse_shell_history():
+    from llm_communicator.tools import parse_shell_history
+    raw = "  501  cd ~/x\n  502  mkdir data\n  503  doit \"summarize\"\n"
+    assert parse_shell_history(raw) == [(501, "cd ~/x"), (502, "mkdir data"), (503, 'doit "summarize"')]
+    assert parse_shell_history("") == []
+
+
+@pytest.mark.parametrize("cmd,expected", [
+    ('doit "make a folder"', True),
+    ("doit -n", True),
+    ("cd ~/x", False),
+    ("mkdir doit_dir", False),   # not a doit invocation
+    ("python train.py", False),
+])
+def test_is_doit_invocation(cmd, expected):
+    from llm_communicator.tools import is_doit_invocation
+    assert is_doit_invocation(cmd) is expected
+
+
+def test_get_last_user_hist_n():
+    from llm_communicator import history_manager
+    assert history_manager.get_last_user_hist_n() == 0
+    history_manager.append_history_turn("", "cd ~/x", "", source="user", hist_n=501)
+    history_manager.append_history_turn("make file", "touch a", "ok")   # doit turn, no hist_n
+    history_manager.append_history_turn("", "mkdir data", "", source="user", hist_n=503)
+    assert history_manager.get_last_user_hist_n() == 503
+
+
+@patch("llm_communicator.llm_bash.load_config")
+def test_sync_user_history_dedups_and_drops_doit(mock_load_config, monkeypatch):
+    """User commands are imported once (dedup via hist_n), `doit ...` lines are dropped, and
+    re-running with the same window adds nothing new."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    agent = BashToolAgent()
+
+    monkeypatch.setenv("DOIT_SHELL_HISTORY", "  10  cd ~/x\n  11  mkdir data\n  12  doit \"hi\"\n")
+    agent._sync_user_history()
+    turns = history_manager.get_history_metadata()
+    user_cmds = [t["command"] for t in turns if t["source"] == "user"]
+    assert user_cmds == ["cd ~/x", "mkdir data"]   # doit line dropped
+
+    # same window again -> nothing new
+    agent._sync_user_history()
+    assert len([t for t in history_manager.get_history_metadata() if t["source"] == "user"]) == 2
+
+    # newer commands -> only the new one imported
+    monkeypatch.setenv("DOIT_SHELL_HISTORY", "  12  doit \"hi\"\n  13  rm klum\n")
+    agent._sync_user_history()
+    user_cmds = [t["command"] for t in history_manager.get_history_metadata() if t["source"] == "user"]
+    assert user_cmds == ["cd ~/x", "mkdir data", "rm klum"]
+
+
+@patch("llm_communicator.llm_bash.load_config")
+def test_sync_noop_without_shell_history(mock_load_config, monkeypatch):
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    agent = BashToolAgent()
+    agent._sync_user_history()
+    assert history_manager.get_history_metadata() == []
+
+
+def test_activity_block_tags_user_and_doit():
+    from llm_communicator import history_manager
+    history_manager.append_history_turn("", "cd ~/x", "", source="user", hist_n=1)
+    history_manager.append_history_turn("make file", "touch klum", "ok")   # doit
+    history_manager.append_history_turn("", "rm klum", "", source="user", hist_n=2)
+
+    agent = BashToolAgent(api_key="fake-key")
+    block = agent._build_activity_block()
+    assert "CURRENT DIRECTORY:" in block
+    assert "[user] cd ~/x" in block
+    assert "[doit] touch klum" in block
+    assert "[user] rm klum" in block
+    # ordering preserved: doit touch comes before the user rm (undo)
+    assert block.index("[doit] touch klum") < block.index("[user] rm klum")
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_user_turn_is_linked_and_replayed(mock_execute_bash, mock_completion):
+    """A file the user created MANUALLY is a first-class linkable turn: 'delete the file I just made'
+    resolves to it and it is replayed in the conversation (next to the instruction), so the agent
+    deletes the right file - not a hallucinated one."""
+    from llm_communicator import history_manager
+    history_manager.append_history_turn("", "touch klum", "", source="user", hist_n=1)
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    tool_call = MockToolCall("d1", "execute_bash_command", {"command": "rm klum", "explanation": "delete"})
+    msg_filter = MockMessage(content="DECISION: YES")
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(MockMessage(tool_calls=[tool_call])),
+        MockResponse(msg_filter),
+    ]
+    mock_execute_bash.return_value = "[Success]"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("delete the file I just made")
+
+    # The user's manual `touch klum` was replayed as a note in the conversation...
+    assert any("[I ran this command directly in the terminal]: touch klum" in (m.get("content") or "")
+               for m in agent.conversation_history)
+    # ...and the agent deleted that exact file.
+    mock_execute_bash.assert_called_once_with("rm klum")
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_user_turn_folded_next_to_instruction_in_fallback(mock_execute_bash, mock_completion):
+    """In fallback mode the user's manual command is folded into the SAME user message as the
+    instruction (max salience for weak models) without breaking user/assistant alternation."""
+    from llm_communicator import history_manager
+    history_manager.append_history_turn("", "touch klum", "", source="user", hist_n=1)
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    msg_gen = MockMessage(content='{"executable": true, "command": "rm klum", "explanation": "delete", "rule_triggered": 1, "response_text": ""}')
+    msg_filter = MockMessage(content="DECISION: YES")
+    mock_completion.side_effect = [MockResponse(msg_analyze), MockResponse(msg_gen), MockResponse(msg_filter)]
+    mock_execute_bash.return_value = "[Success]"
+
+    with patch("llm_communicator.llm_bash.load_config", return_value=("ollama/qwen3:4b-instruct", None, False)):
+        agent = BashToolAgent()
+        with patch("builtins.input", return_value="y"):
+            agent.run_single("delete the file I just made")
+
+    # Some user message carries BOTH the user's command note and the instruction together (folded).
+    user_msgs = [m["content"] for m in agent.conversation_history if m["role"] == "user"]
+    assert any("touch klum" in c and "delete the file I just made" in c for c in user_msgs)
+    mock_execute_bash.assert_called_once_with("rm klum")
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_what_did_you_just_do_triggers_resolution(mock_completion):
+    """'what did you just do' must trip the context heuristic so the resolver runs and links the
+    most recent action (not short-circuit to [])."""
+    mock_completion.return_value = MockResponse(MockMessage(content='{"relevant_ids": [2]}'))
+    agent = BashToolAgent(api_key="fake-key")
+    metadata = [
+        {"id": 1, "source": "doit", "prompt": "list", "command": "ls", "suggested_command": ""},
+        {"id": 2, "source": "doit", "prompt": "delete klum", "command": "rm klum", "suggested_command": ""},
+    ]
+    ids = agent._analyze_references("what did you just do", metadata)
+    mock_completion.assert_called_once()          # resolver ran (not short-circuited)
+    assert ids == [2]                              # linked the most recent action
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_plain_command_still_short_circuits_resolution(mock_completion):
+    """A plain, independent command must still skip the resolver LLM call."""
+    agent = BashToolAgent(api_key="fake-key")
+    metadata = [{"id": 1, "source": "doit", "prompt": "list", "command": "ls", "suggested_command": ""}]
+    ids = agent._analyze_references("create a file called report.txt", metadata)
+    mock_completion.assert_not_called()
+    assert ids == []
+
+
+def test_system_prompt_activity_questions_answered_not_run():
+    """Rule 10 (backstop) tells the agent to ANSWER 'what did I/you just do' from context, not run a command."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    lowered = DOIT_SYSTEM_PROMPT.lower()
+    assert "what did you just do" in lowered or "what did i just do" in lowered
+    assert "must not run or generate a command" in lowered
+
+
+@pytest.mark.parametrize("text,subject", [
+    ("what did I just do", "user"),
+    ("what did i do", "user"),
+    ("summarize what I just did", "user"),
+    ("recap what I did", "user"),
+    ("remind me what I ran", "user"),
+    ("what have I been doing", "user"),
+    ("what did you just do", "doit"),
+    ("what did doit just run", "doit"),
+    ("what just happened", "both"),
+    ("what's been going on", "both"),
+    ("list the files", None),
+    ("delete the file I just made", None),
+])
+def test_is_activity_query(text, subject):
+    from llm_communicator.tools import is_activity_query
+    assert is_activity_query(text) == subject
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_activity_query_answered_deterministically(mock_execute_bash, mock_completion, monkeypatch):
+    """'what did I just do' is answered from history - NO LLM call, NO command run - with correct
+    attribution (the user's manual command -> the user)."""
+    from llm_communicator import history_manager
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    history_manager.append_history_turn("", "touch klum", "", source="user", hist_n=1)
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("what did I just do")
+
+    mock_completion.assert_not_called()           # no LLM at all
+    mock_execute_bash.assert_not_called()          # no command run (the qwen `ls -l` bug)
+    last = history_manager.get_full_turns([2])[0]
+    assert last["command"] == ""                   # answered, not a command turn
+    assert "touch klum" in last["output"]
+    assert "Your most recent command was" in last["output"]
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_activity_query_doit_first_person(mock_execute_bash, mock_completion):
+    """'what did you just do' reports doit's own last action in the first person."""
+    from llm_communicator import history_manager
+    history_manager.append_history_turn("delete klum", "rm -f klum", "0 (SUCCESS)")  # doit turn
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("what did you just do")
+
+    mock_completion.assert_not_called()
+    mock_execute_bash.assert_not_called()
+    last = history_manager.get_full_turns([2])[0]
+    assert "rm -f klum" in last["output"]
+    assert "My most recent action was" in last["output"]
+
+
+@pytest.mark.parametrize("text,subject", [
+    ("explain what you just did", "doit"),
+    ("explain what I just did", "user"),
+    ("explain the command I just performed", "user"),
+    ("explain that action", "both"),
+    ("I just performed a command, explain what it did", "user"),
+])
+def test_is_activity_query_explain_variants(text, subject):
+    from llm_communicator.tools import is_activity_query
+    assert is_activity_query(text) == subject
+
+
+@patch("llm_communicator.tools.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_explain_query_uses_focused_subcall_not_command(mock_execute_bash, mock_completion, monkeypatch):
+    """'explain what I just did' reports the user's recent command and explains it via the focused
+    sub-call - it does NOT run a command (the gemma `ls` / capability-rejection bugs)."""
+    from llm_communicator import history_manager
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    history_manager.append_history_turn("", "touch klum", "", source="user", hist_n=1)
+    # the ONLY litellm call is the focused explain sub-call (tools.litellm)
+    mock_completion.return_value = MockResponse(MockMessage(content="It creates an empty file named klum."))
+
+    with patch("llm_communicator.llm_bash.load_config", return_value=("ollama/gemma3:4b", None, False)):
+        agent = BashToolAgent()
+        agent.run_single("explain what I just did")
+
+    mock_execute_bash.assert_not_called()          # no command run
+    last = history_manager.get_full_turns([2])[0]
+    assert "touch klum" in last["output"]
+    assert "creates an empty file named klum" in last["output"]
+
+
+def test_activity_report_collapses_consecutive_duplicates():
+    from llm_communicator import history_manager
+    for n in (1, 2, 3):
+        history_manager.append_history_turn("", "touch klum", "", source="user", hist_n=n)
+    history_manager.append_history_turn("", "git status", "", source="user", hist_n=4)
+    agent = BashToolAgent(api_key="fake-key")
+    answer = agent._answer_activity_query("user")
+    assert answer.count("touch klum") == 1   # 3 consecutive collapsed to 1 (plus the lead line uses git status)
+
+
+@patch("llm_communicator.llm_bash.load_config")
+def test_synced_user_command_has_ran_marker_not_empty_output(mock_load_config, monkeypatch):
+    """A synced user command gets an explicit 'it ran' output (not empty), so the model doesn't read
+    empty output as a failure."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    agent = BashToolAgent()
+    monkeypatch.setenv("DOIT_SHELL_HISTORY", "  5  touch klum\n")
+    agent._sync_user_history()
+
+    turn = history_manager.get_full_turns([1])[0]
+    assert turn["source"] == "user"
+    assert turn["output"] != ""
+    assert "ran by the user" in turn["output"].lower()
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_user_turn_replay_includes_ran_marker(mock_execute_bash, mock_completion):
+    """The replayed user turn carries the 'it ran' marker so the agent won't treat it as failed."""
+    from llm_communicator import history_manager
+    history_manager.append_history_turn("", "touch klum", "[Ran by the user directly in the terminal and completed; output not captured by doit.]", source="user", hist_n=1)
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    tool_call = MockToolCall("d1", "execute_bash_command", {"command": "rm klum", "explanation": "delete"})
+    msg_filter = MockMessage(content="DECISION: YES")
+    mock_completion.side_effect = [MockResponse(msg_analyze), MockResponse(MockMessage(tool_calls=[tool_call])), MockResponse(msg_filter)]
+    mock_execute_bash.return_value = "[Success]"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("delete the file I just made")
+
+    assert any("Ran by the user" in (m.get("content") or "") for m in agent.conversation_history)
+
+
+def test_parse_cmd_log():
+    from llm_communicator.tools import parse_cmd_log
+    raw = "0\ttouch klum\n1\tfalse\n2\tls /nope\n"
+    assert parse_cmd_log(raw) == [(1, "0", "touch klum"), (2, "1", "false"), (3, "2", "ls /nope")]
+    assert parse_cmd_log("") == []
+
+
+@patch("llm_communicator.llm_bash.load_config")
+def test_sync_uses_exit_status_log_success_and_failure(mock_load_config, monkeypatch, tmp_path):
+    """When DOIT_CMD_LOG is present, user turns carry REAL success/failure from the exit status."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    log = tmp_path / "cmdlog.tsv"
+    log.write_text("0\ttouch klum\n2\tcat /nonexistent\n")
+    monkeypatch.setenv("DOIT_CMD_LOG", str(log))
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+
+    agent = BashToolAgent()
+    agent._sync_user_history()
+
+    turns = history_manager.get_full_turns([1, 2])
+    assert turns[0]["command"] == "touch klum"
+    assert "completed successfully (exit 0)" in turns[0]["output"]
+    assert turns[1]["command"] == "cat /nonexistent"
+    assert "FAILED (exit 2)" in turns[1]["output"]
+
+
+@patch("llm_communicator.llm_bash.load_config")
+def test_cmd_log_preferred_over_fc_history(mock_load_config, monkeypatch, tmp_path):
+    """The exit-status log is preferred over the fc -l fallback when both are present."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    log = tmp_path / "cmdlog.tsv"
+    log.write_text("0\tmkdir data\n")
+    monkeypatch.setenv("DOIT_CMD_LOG", str(log))
+    monkeypatch.setenv("DOIT_SHELL_HISTORY", "  9  some other command\n")
+
+    agent = BashToolAgent()
+    agent._sync_user_history()
+    cmds = [t["command"] for t in history_manager.get_history_metadata() if t["source"] == "user"]
+    assert cmds == ["mkdir data"]   # from the log, not the fc history

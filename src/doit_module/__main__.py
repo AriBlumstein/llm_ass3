@@ -26,6 +26,7 @@ def main():
     )
     args = parser.parse_args()
 
+    # `instruction` is required EXCEPT with -n/--new (which may be used alone to just clear history).
     if not args.instruction:
         if args.new:
             try:
@@ -35,9 +36,8 @@ def main():
             except Exception as e:
                 print(f"An error occurred: {e}")
                 sys.exit(1)
-        else:
-            parser.print_help()
-            sys.exit(1)
+        # No instruction and no -n: emit argparse's standard required-argument error (exit 2).
+        parser.error("the following arguments are required: instruction")
 
     # On an interactive run that isn't already going through the doit shell function, offer to
     # install the integration that makes cd/export persist. Keeps asking until accepted; no-op when

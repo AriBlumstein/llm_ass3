@@ -82,7 +82,8 @@ def ensure_shell_integration(input_fn=input) -> None:
             return
 
         # Ask. If declined, we write nothing, so this prompt returns on the next run too.
-        print("[doit] Persistent navigation (cd / export / alias) needs a one-line shell hook.")
+        print("[doit] Persistent navigation (cd / export) AND user-awareness (so doit can see your "
+              "recent terminal commands) need a one-line shell hook.")
         try:
             answer = input_fn(f"      Add it to {rc} now? [Y/n]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
