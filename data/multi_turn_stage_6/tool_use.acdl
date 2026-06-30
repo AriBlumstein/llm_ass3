@@ -1,0 +1,150 @@
+// Doit Agent Context: Tool Use Scenario (Multi-Turn Stage 6 - output awareness)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = true).
+// Stage 6 carries over everything from Stage 5 (user awareness) and adds OUTPUT AWARENESS: the user
+// can ask questions ABOUT a previous command's output ("which of these is safe to delete?", "why did
+// that command fail?"), answered directly from the output or by running a further command.
+//
+//   doit's OWN commands already store full output (stdout/stderr/return code) in history and replay
+//       it - so questions about them are answered from the replayed output (Rule 7 / Rule 11).
+//   The USER's own commands store only command text + exit status (Stage 5), NOT output. So to answer
+//       a question about a USER command's output, the agent RE-RUNS / pipes that command (Rule 11):
+//       if it succeeded and is read-only, re-run it (optionally piped) to get the data; if it failed,
+//       reproduce the error or explain from command+status; if it would modify state, don't re-run.
+//   SAFETY NET (deterministic): for any follow-up (instruction_has_context_indicator), run_single
+//       ALWAYS adds get_latest_output_turn_id() - the most recent doit turn with real output - to the
+//       replayed turns, so output questions work even if the reference resolver linked nothing (or an
+//       output-less user command among the noise).
+//
+// DETERMINISTIC Python checks run BEFORE the main pipeline and can short-circuit (in order):
+//   - activity query (is_activity_query): "what did I/you/we just do" -> answer from history (no LLM,
+//                                         now with we->doit attribution); "explain ..." -> ExplainCommand.
+//
+// Per user turn @T the LLM contexts are, in order:
+//   0) ExplainCommand            - explains a recent command for an "explain ..." activity query    (unchanged)
+//   1) HistoryReferenceResolver  - picks relevant prior turns; output-question indicators + attribution (CHANGED)
+//   2) DoitToolUseAgent          - generates/answers; now OUTPUT-aware (Rule 11) + safety-net replay  (CHANGED)
+//   3) ClarificationAuthor       - authors the clarifying question                                  (unchanged)
+//   4) BashFilter                - judges filesystem modification; vets hoisted commands too         (unchanged)
+//   5) MemoryManager             - stores/updates/deletes durable memories after the turn            (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Convention: index < @T = prior turn.
+
+
+// 0. ExplainCommand (explain_command) - unchanged from Stage 5.
+ExplainCommand[@T]: {
+    S: {
+        sys.explain_command_prompt
+    }
+
+    U: sys.pid.most_recent_command[@T]
+}
+
+
+// 1. HistoryReferenceResolver (_analyze_references) - CHANGED vs Stage 5.
+//    The cheap context-indicator short-circuit (instruction_has_context_indicator) now also fires on
+//    output-question phrasings ("the output", "why did", "safe", "biggest", ...). The system prompt now
+//    also states the ATTRIBUTION DEFAULTS (you/we -> doit, I -> user, bare reference -> most recent).
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // CHANGED: now states the attribution defaults
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]
+    }
+}
+
+
+// 2. DoitToolUseAgent - CHANGED vs Stage 5.
+//    The system prompt now carries Rule 11 (output awareness) and Rule 10's attribution defaults. The
+//    replayed history is the resolver's picks PLUS the safety-net latest-output turn (for follow-ups),
+//    so a question about the previous output always has the data. Answering a question about a USER
+//    command's (uncaptured) output means generating a command that RE-RUNS / pipes it (Rule 11).
+DoitToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // now includes Rule 10 attribution defaults + Rule 11 (output awareness)
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]
+        }
+        sys.activity_block[@T]                  // CURRENT DIRECTORY + recent [user]/[doit] activity
+        sys.tools_definition
+    }
+
+    ForEach(@d: sys.fewshot_toolcall) {
+        U: sys.fewshot_toolcall[@d].instruction
+        A: sys.fewshot_toolcall[@d].tool_call
+        T: sys.fewshot_toolcall[@d].result
+    }
+
+    // Replayed relevant history. CHANGED: the id set is the resolver's relevant_ids PLUS (for a
+    // follow-up) get_latest_output_turn_id() - the most recent doit turn with real output - so output
+    // questions always have the previous output even when the resolver linked nothing.
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids + sys.pid.latest_output_turn[@T]) {
+        If(sys.pid.turn[@t].source == "user") {
+            U: user_ran_note(sys.pid.turn[@t].command, sys.pid.turn[@t].output)   // command + status marker (output not captured); the agent RE-RUNS it to answer (Rule 11)
+        } Else {
+            U: sys.pid.turn[@t].prompt
+            If(sys.pid.turn[@t].command != "") {
+                A: sys.pid.tool_call[@t]
+                T: sys.pid.turn[@t].output           // doit's real output - answered from directly
+            } Else {
+                If(sys.pid.turn[@t].suggested_command != "") {
+                    A: sys.pid.answer_call[@t]
+                    T: sys.answer_delivered_notice
+                } Else {
+                    A: sys.pid.turn[@t].output
+                }
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    ForEach(i: pid.clarification_steps[@T]) {
+        If(resp.pid.doit_tool_use_agent[@T.i].asks_clarification) {
+            A: resp.pid.doit_tool_use_agent[@T.i].ask_user_clarification_call
+            T: env.user_clarification_answer[@T.i]
+        }
+    }
+    // Terminal action: execute_bash_command (incl. a RE-RUN/pipe of a user command to answer about its
+    // output, Rule 11); answer_question (answered directly from the replayed output); or plain text.
+}
+
+
+// 3. ClarificationAuthor (_author_clarification) - unchanged from Stage 5.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 4. BashFilter (_filter_bash) - unchanged from Stage 5 (vets every command, incl. a re-run).
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction
+        resp.pid.doit_tool_use_agent[@T].tool_call[0].command
+    }
+}
+
+
+// 5. MemoryManager (extract_memories) - unchanged from Stage 5.
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_tool_use_agent[@T].command
+        sys.memories[@T]
+    }
+}

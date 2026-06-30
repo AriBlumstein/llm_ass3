@@ -1,0 +1,196 @@
+// Doit Agent Context: Tool Use Scenario (Multi-Turn Stage 7 - multi-window / cross-session awareness)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = true).
+// Stage 7 carries over everything from Stage 6 (output awareness) and adds MULTI-WINDOW awareness:
+// doit can resolve EXPLICIT references to a DIFFERENT terminal window's history, while keeping each
+// window's history isolated by default.
+//
+//   Each terminal window is its own session, identified by its shell PID (DOIT_PPID, pinned by
+//       doit-init.sh to the shell's $$). Its folder <repo>/.doit/history_<pid>/ holds doit.jsonl,
+//       cmdlog.tsv, and session.json (the registry: pid, cwd, created_at, last_active_at).
+//   (sync, no LLM) At the TOP of each turn doit refreshes THIS session's session.json (write_session_meta),
+//       so other windows are discoverable by pid + cwd + recency. It is refreshed AGAIN after a hoisted
+//       `cd` (with the target dir), so other windows see this session's new location immediately.
+//   The main agent's system prompt now ALSO carries Rule 12 (multi-window): use only THIS session by
+//       default; use another session ONLY on an explicit reference; re-ground the task in the cwd
+//       (but for a QUESTION about another session's output, answer from the injected turns).
+//
+// DETERMINISTIC Python checks run BEFORE the main pipeline and can short-circuit (in order):
+//   - activity query (is_activity_query): "what did I/you just do" -> answer from history (no LLM);
+//                                         "explain ..."             -> ExplainCommand sub-call;
+//                                         if it ALSO references another window ("what command was run in
+//                                         session 12345") -> report THAT session's recent activity, no LLM
+//                                         (CrossSessionActivityReport, via _resolve_target_session). Then DONE.
+//   - session list (is_session_list_query): "list the shell numbers" / "what are the other sessions"
+//                                         -> report the registry (pid, cwd, recency, live/closed) from
+//                                         list_sessions. No LLM. Then DONE.
+//
+// Per user turn @T the LLM contexts are, in order:
+//   0) ExplainCommand            - explains a recent command for an "explain ..." activity query    (unchanged)
+//   1) CrossSessionResolver      - ONLY on an explicit cross-window reference: picks the other session (NEW)
+//   1') HistoryReferenceResolver - same-session resolver; SKIPPED when a cross-session ref fired     (CHANGED)
+//   2) DoitToolUseAgent          - generates/answers; now multi-window aware; cross-session turns injected (CHANGED)
+//   3) ClarificationAuthor       - authors the clarifying question; ALSO used (with a session menu) to pick a window (CHANGED)
+//   4) BashFilter                - judges filesystem modification; vets hoisted commands too         (unchanged)
+//   5) MemoryManager             - stores/updates/deletes durable memories after the turn            (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Convention: index < @T = prior turn.
+
+
+// 0. ExplainCommand (explain_command) - unchanged from Stage 6.
+ExplainCommand[@T]: {
+    S: {
+        sys.explain_command_prompt
+    }
+
+    U: sys.pid.most_recent_command[@T]
+}
+
+
+// 0'. CrossSessionActivityReport (_answer_cross_session_activity) - NEW in Stage 7, no LLM.
+//     When an activity query ALSO references another window ("what command was recently run in session
+//     12345"), the activity route resolves the target session (via _resolve_target_session: exact pid,
+//     else CrossSessionResolver, else menu) and REPORTS that session's recent command-bearing turns
+//     straight from its doit.jsonl - deterministic, no command run. Then DONE. (No LLM context of its
+//     own beyond the optional resolver in _resolve_target_session.)
+
+
+// 1. CrossSessionResolver (resolve_cross_session) - NEW in Stage 7.
+//    Fires ONLY when is_cross_session_reference(instruction) matched AND >=1 other session exists, and
+//    the reference is NOT an exact pid (an explicit "session <pid>" is resolved deterministically, no LLM).
+//    Picks WHICH other window the user means and WHICH of its turns are relevant; if not confident, the
+//    caller falls back to ClarificationAuthor-style menu (step 3). Other-session summaries come from the
+//    registry (list_other_sessions: pid, cwd, recency, recent commands).
+CrossSessionResolver[@T]: {
+    S: {
+        sys.cross_session_resolver_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.other_sessions_summary[@T]          // numbered: each other session's pid, cwd, last-active, recent commands (with ids)
+    }
+    // -> (pid, relevant_ids, confident) The resolved turns are read from that session's doit.jsonl.
+}
+
+
+// 1'. HistoryReferenceResolver (_analyze_references) - CHANGED vs Stage 6.
+//     SAME-session resolver. SKIPPED entirely when a cross-session reference fired (the explicit
+//     reference is to ANOTHER window, so this window's history is deliberately not mixed in). Otherwise
+//     unchanged from Stage 6.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // now also states the attribution defaults (you/we -> doit, I -> user, bare -> most recent)
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]
+    }
+}
+
+
+// 2. DoitToolUseAgent - CHANGED vs Stage 6.
+//    The system prompt now ALSO carries Rule 12 (multi-window). When a cross-session reference was
+//    resolved, the relevant turns from the OTHER session are injected (tagged) right before the
+//    instruction INSTEAD of this session's history; the agent then generates the command for the
+//    CURRENT cwd (re-grounded per Rule 12).
+DoitToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // carries Rule 11 (output awareness, Stage 6) and adds Rule 12 (multi-window, NEW)
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]
+        }
+        sys.activity_block[@T]                  // CURRENT DIRECTORY + recent [user]/[doit] activity (this session)
+        sys.tools_definition
+    }
+
+    ForEach(@d: sys.fewshot_toolcall) {
+        U: sys.fewshot_toolcall[@d].instruction
+        A: sys.fewshot_toolcall[@d].tool_call
+        T: sys.fewshot_toolcall[@d].result
+    }
+
+    If(resp.pid.cross_session_resolver[@T].matched) {
+        // Cross-session: relevant turns from the CHOSEN other session, tagged, injected as plain notes.
+        ForEach(@x: resp.pid.cross_session_resolver[@T].relevant_ids) {
+            U: cross_session_note(sys.other.turn[@x])   // "[from your other terminal session (pid ...) in <cwd>]: \"<prompt>\" -> ran `<command>`\n<output>"
+        }
+    } Else {
+        // Same-session replay (Stage 6 behavior): doit turns as tool call+result; user turns as notes.
+        // OUTPUT-AWARENESS SAFETY NET: for a follow-up (instruction_has_context_indicator), the
+        // replayed ids ALSO always include get_latest_output_turn_id() (the most recent doit turn with
+        // real output), so "why did that fail?" / "which of these is safe to delete?" have the output
+        // even if the resolver linked nothing or an output-less user command.
+        ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids + sys.pid.latest_output_turn[@T]) {
+            If(sys.pid.turn[@t].source == "user") {
+                U: user_ran_note(sys.pid.turn[@t].command, sys.pid.turn[@t].output)
+            } Else {
+                U: sys.pid.turn[@t].prompt
+                If(sys.pid.turn[@t].command != "") {
+                    A: sys.pid.tool_call[@t]
+                    T: sys.pid.turn[@t].output
+                } Else {
+                    If(sys.pid.turn[@t].suggested_command != "") {
+                        A: sys.pid.answer_call[@t]
+                        T: sys.answer_delivered_notice
+                    } Else {
+                        A: sys.pid.turn[@t].output
+                    }
+                }
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    ForEach(i: pid.clarification_steps[@T]) {
+        If(resp.pid.doit_tool_use_agent[@T.i].asks_clarification) {
+            A: resp.pid.doit_tool_use_agent[@T.i].ask_user_clarification_call
+            T: env.user_clarification_answer[@T.i]
+        }
+    }
+    // Terminal action: execute_bash_command (-> BashFilter, then hoisted if cd/session-state else run);
+    // answer_question; or plain text. A cross-session task is re-grounded in the CURRENT cwd (Rule 12).
+}
+
+
+// 3. ClarificationAuthor (_author_clarification) - CHANGED vs Stage 6.
+//    Still authors a clarifying question for an ambiguous instruction. ALSO reused by the cross-session
+//    route: when CrossSessionResolver is not confident, ask_clarification is called with a PREBUILT menu
+//    of the candidate sessions (pid + cwd + last-active) so the user picks the window (no LLM authoring
+//    in that case).
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 4. BashFilter (_filter_bash) - unchanged from Stage 6 (vets every command, hoisted or not).
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction
+        resp.pid.doit_tool_use_agent[@T].tool_call[0].command
+    }
+}
+
+
+// 5. MemoryManager (extract_memories) - unchanged from Stage 6.
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_tool_use_agent[@T].command
+        sys.memories[@T]
+    }
+}

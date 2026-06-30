@@ -1,0 +1,158 @@
+// Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Multi-Turn Stage 6 - output awareness)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = false). The model emits a raw fallback-JSON
+// block; execution output and clarification answers are fed back as USER messages.
+//
+// Stage 6 carries over everything from Stage 5 (user awareness) and adds OUTPUT AWARENESS: the user
+// can ask questions ABOUT a previous command's output, answered from the output or by running a
+// further command.
+//
+//   doit's OWN commands already store full output and replay it -> answered from the replayed output.
+//   The USER's own commands store only command text + exit status (Stage 5), NOT output. To answer a
+//       question about a USER command's output the agent RE-RUNS / pipes that command (Rule 11): if it
+//       succeeded and is read-only, re-run it (optionally piped); if it failed, reproduce the error or
+//       explain from command+status; if it would modify state, don't re-run.
+//   SAFETY NET (deterministic): for any follow-up (instruction_has_context_indicator), run_single
+//       ALWAYS adds get_latest_output_turn_id() (the most recent doit turn with real output) to the
+//       replayed turns, so output questions work even if the resolver linked nothing.
+//
+// DETERMINISTIC Python checks run BEFORE the main pipeline and can short-circuit (in order):
+//   - activity query (is_activity_query): "what did I/you/we just do" -> answer from history (no LLM,
+//                                         now with we->doit attribution); "explain ..." -> ExplainCommand.
+//   - how-to question (is_howto_question)             -> HowtoAnswerSubcall, then DONE.
+//   - "execute that" (is_execute_suggestion_request) AND a prior suggested_command exists
+//                                                      -> run that command through BashFilter, then DONE.
+// Otherwise the pipeline runs:
+//   1) HistoryReferenceResolver  - picks relevant prior turns; output-question indicators + attribution (CHANGED)
+//   2) DoitNonToolUseAgent       - generates/answers; now OUTPUT-aware (Rule 11) + safety-net replay  (CHANGED)
+//   3) ClarificationAuthor       - authors the clarifying question                                  (unchanged)
+//   4) BashFilter                - judges filesystem modification; vets hoisted commands too         (unchanged)
+//   5) MemoryManager             - stores/updates/deletes durable memories after the turn            (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Convention: index < @T = prior turn.
+
+
+// 0a. ExplainCommand (explain_command) - unchanged from Stage 5.
+ExplainCommand[@T]: {
+    S: {
+        sys.explain_command_prompt
+    }
+
+    U: sys.pid.most_recent_command[@T]
+}
+
+
+// 0b. HowtoAnswerSubcall (answer_howto_question) - unchanged from Stage 5.
+HowtoAnswerSubcall[@T]: {
+    S: {
+        sys.answer_howto_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 1. HistoryReferenceResolver (_analyze_references) - CHANGED vs Stage 5.
+//    The context-indicator short-circuit now also fires on output-question phrasings; the system
+//    prompt now states the ATTRIBUTION DEFAULTS (you/we -> doit, I -> user, bare -> most recent).
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // CHANGED: now states the attribution defaults
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]
+    }
+}
+
+
+// 2. DoitNonToolUseAgent - CHANGED vs Stage 5.
+//    The system prompt now carries Rule 11 (output awareness) + Rule 10's attribution defaults. The
+//    replayed history is the resolver's picks PLUS the safety-net latest-output turn (for follow-ups).
+//    Answering about a USER command's (uncaptured) output means emitting a fallback-JSON command that
+//    RE-RUNS / pipes it (Rule 11).
+DoitNonToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // now includes Rule 10 attribution defaults + Rule 11 (output awareness)
+        sys.fallback_system_instruction
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]
+        }
+        sys.activity_block[@T]
+    }
+
+    ForEach(@d: sys.fewshot_fallback) {
+        U: sys.fewshot_fallback[@d].instruction
+        A: sys.fewshot_fallback[@d].response
+    }
+
+    // Replayed relevant history, folded into user_content. CHANGED: the id set is the resolver's
+    // relevant_ids PLUS (for a follow-up) get_latest_output_turn_id(), so output questions always have
+    // the previous output even when the resolver linked nothing.
+    ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids + sys.pid.latest_output_turn[@T]) {
+        If(sys.pid.turn[@t].source == "user") {
+            U: user_ran_note(sys.pid.turn[@t].command, sys.pid.turn[@t].output)   // command + status (output not captured); agent RE-RUNS it to answer (Rule 11)
+        } Else {
+            U: sys.pid.turn[@t].prompt
+            If(sys.pid.turn[@t].command != "") {
+                A: sys.pid.tool_call[@t]            // SERIALIZED fallback-JSON: executable=true, command, rule_triggered=1
+                T: sys.pid.turn[@t].output          // SERIALIZED USER message "Command execution output: <output>" - answered from directly
+            } Else {
+                If(sys.pid.turn[@t].suggested_command != "") {
+                    A: sys.pid.answer_replay[@t]    // SERIALIZED fallback-JSON: executable=false, suggested_command, rule_triggered=9
+                } Else {
+                    A: sys.pid.turn[@t].output
+                }
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    ForEach(i: pid.clarification_steps[@T]) {
+        If(resp.pid.doit_non_tool_use_agent[@T.i].needs_clarification) {
+            A: resp.pid.doit_non_tool_use_agent[@T.i]
+            T: env.user_clarification_answer[@T.i]
+        }
+    }
+    // Terminal fallback-JSON: executable=true (incl. a RE-RUN/pipe of a user command to answer about
+    // its output, Rule 11); rule_triggered=9 (answered directly from replayed output); or a rejection.
+}
+
+
+// 3. ClarificationAuthor (_author_clarification) - unchanged from Stage 5.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 4. BashFilter (_filter_bash) - unchanged from Stage 5.
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction
+        resp.pid.doit_non_tool_use_agent[@T].command
+    }
+}
+
+
+// 5. MemoryManager (extract_memories) - unchanged from Stage 5.
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_non_tool_use_agent[@T].command
+        sys.memories[@T]
+    }
+}

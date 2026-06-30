@@ -32,8 +32,12 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 import litellm
+from datetime import datetime, timezone
 
-from fixtures import CLARIFY_AUTHOR_PROMPT, ANSWER_HOWTO_PROMPT, MEMORY_MANAGER_PROMPT, CTX_NUM
+from fixtures import (
+    CLARIFY_AUTHOR_PROMPT, ANSWER_HOWTO_PROMPT, MEMORY_MANAGER_PROMPT, CTX_NUM,
+    CROSS_SESSION_RESOLVER_PROMPT,
+)
 from doit_module.config_loader import load_config
 
 
@@ -315,10 +319,12 @@ def _author_clarification(instruction: str) -> tuple:
 # How-to question openers. Detected deterministically (in Python) so weak non-tool-calling
 # models never have to CLASSIFY the request - they only have to ANSWER it via answer_howto_question.
 HOWTO_PATTERNS = [
-    r"^\s*how (do|would|can|could|should) (i|you)\b",
-    r"^\s*how to\b",
-    r"^\s*what('?s| is| are) the (command|commands|way|steps) (to|for)\b",
+    # "how do I / how does one / how can you / how would someone ..." - many verb+subject combos.
+    r"^\s*how (do|does|would|can|could|should|might|to)\b",
+    r"^\s*what('?s| is| are) the (command|commands|way|steps|syntax) (to|for)\b",
+    r"^\s*what('?s| is) the best way (to|for)\b",
     r"^\s*what command\b",
+    r"^\s*is there (a|an|any) (command|way) (to|for|that)\b",
 ]
 
 
@@ -405,6 +411,10 @@ ACTIVITY_QUERY_PATTERNS = [
     (r"\bmy\s+(recent|last|previous)\b.*\b(command|step|action|thing)", "user"),
     (r"\bwhat\s+did\s+(you|doit|we)\b.*\b(do|run|just|execute)\b", "doit"),
     (r"\bwhat\s+have\s+(you|we)\s+(done|run)\b", "doit"),
+    # "what command(s) was/were recently run/ran/executed" - a report query (matters most for a
+    # cross-session reference like "... in session 12345", handled in the activity route).
+    (r"\bwhat\s+commands?\b.*\b(was|were|ran|run|recently|executed?)\b", "both"),
+    (r"\b(recent|last|latest|previous)\s+commands?\b.*\bin\b", "both"),
     (r"\bwhat\s+just\s+happened\b", "both"),
     (r"\bwhat('?s| has)\s+been\s+(going\s+on|happening)\b", "both"),
     # "explain what you/I just did" / "explain that action" - explanation of a recent action
@@ -427,6 +437,150 @@ def is_activity_query(instruction: str) -> Optional[str]:
         if re.search(pat, text):
             return subject
     return None
+
+
+# --- Multi-window / cross-session referencing ------------------------------------------------------
+
+# "List my terminal sessions / shell numbers" - answered deterministically from the registry (no LLM,
+# no command run), so the user can discover which shell PID to reference.
+# PLURAL nouns for the question/possessive forms, so a LIST query ("what are the other sessions") is
+# distinguished from a SINGULAR cross-session reference ("the other window"). list/show verbs + the
+# "shell numbers" form are matched explicitly.
+SESSION_LIST_PATTERNS = [
+    r"\b(list|show|see|view|enumerate)\b.*\b(sessions|shells|windows|terminals)\b",
+    r"\bshell\s+numbers?\b",
+    r"\b(what|which|how\s+many)\b.*\b(sessions|shells|windows|terminals)\b",
+    r"\b(my|the|all|other|current|open|active)\s+(\w+\s+)?(sessions|shells|windows|terminals)\b",
+]
+
+
+def is_session_list_query(instruction: str) -> bool:
+    """True when the user asks to see their open terminal sessions / shell numbers."""
+    text = (instruction or "").lower()
+    return any(re.search(p, text) for p in SESSION_LIST_PATTERNS)
+
+
+# Explicit references to ANOTHER terminal window/session. Kept specific so a bare "them/that/it"
+# (a same-session follow-up) does NOT match - that preserves per-window isolation.
+CROSS_SESSION_PATTERNS = [
+    r"\b(the\s+)?other\s+(window|terminal|session|shell)\b",
+    r"\b(window|terminal|session|shell|pid)\s+#?\d+\b",   # "session 12345"
+    r"\b#?\d+\s+(window|terminal|session|shell)\b",        # "the 12345 session"
+    r"\bin\s+the\s+other\b",
+    r"\b(we|i)\s+did\s+in\b",
+    r"\bfrom\s+(the\s+)?(window|terminal|session|shell|other)\b",
+    r"\bin\s+(window|terminal|session)\s",
+    r"\belsewhere\b",
+]
+
+
+def is_cross_session_reference(instruction: str) -> bool:
+    """True when the instruction explicitly refers to a DIFFERENT terminal window/session. Gated
+    narrowly so ordinary same-session follow-ups stay isolated to the current window."""
+    text = (instruction or "").lower()
+    return any(re.search(p, text) for p in CROSS_SESSION_PATTERNS)
+
+
+def extract_session_pid(instruction: str) -> Optional[str]:
+    """The shell number from a qualified reference - either order: 'session 12345' / 'pid 12345' OR
+    'the 12345 session' / '12345 window' (the digits only), else None. The CALLER checks it against
+    the known session pids: a real pid matches exactly; a positional 'window 2' won't match a pid and
+    falls through to fuzzy resolution."""
+    text = instruction or ""
+    m = (re.search(r"\b(?:window|terminal|session|shell|pid)\s+#?(\d+)\b", text, re.IGNORECASE)
+         or re.search(r"\b#?(\d+)\s+(?:window|terminal|session|shell)\b", text, re.IGNORECASE))
+    return m.group(1) if m else None
+
+
+def _ago(iso_ts: Optional[str]) -> str:
+    """A short 'Nm/Nh/Nd ago' from an ISO-8601 timestamp; '' when unknown/unparseable."""
+    if not iso_ts:
+        return ""
+    try:
+        then = datetime.fromisoformat(iso_ts)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        secs = (datetime.now(timezone.utc) - then).total_seconds()
+    except Exception:
+        return ""
+    if secs < 90:
+        return "just now"
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n:
+            return f"{int(secs // n)}{unit} ago"
+    return "just now"
+
+
+def _session_alive_tag(s: Dict[str, Any]) -> str:
+    if s.get("is_current"):
+        return "this window"
+    alive = s.get("alive")
+    return "live" if alive else ("closed" if alive is False else "")
+
+
+def format_sessions_summary(sessions: List[Dict[str, Any]]) -> str:
+    """A compact, numbered listing of sessions for the cross-session resolver's context."""
+    lines = []
+    for i, s in enumerate(sessions, 1):
+        tag = _session_alive_tag(s)
+        head = f"{i}. pid {s.get('pid')} - {s.get('cwd') or '(unknown dir)'}"
+        meta = " - ".join(x for x in (_ago(s.get("last_active_at")), tag) if x)
+        if meta:
+            head += f" ({meta})"
+        lines.append(head)
+        for r in s.get("recent", []):
+            lines.append(f"     {r}")
+    return "\n".join(lines) if lines else "(no other sessions)"
+
+
+def format_sessions_menu(sessions: List[Dict[str, Any]]) -> List[str]:
+    """One human-readable option string per session, for the clarification menu."""
+    opts = []
+    for s in sessions:
+        tag = _session_alive_tag(s)
+        recent = s.get("recent") or []
+        gist = ("; " + recent[-1]) if recent else ""
+        meta = ", ".join(x for x in (_ago(s.get("last_active_at")), tag) if x)
+        opts.append(f"pid {s.get('pid')} - {s.get('cwd') or '(unknown dir)'}"
+                    + (f" ({meta})" if meta else "") + gist)
+    return opts
+
+
+def resolve_cross_session(instruction: str, sessions_summary: str) -> Dict[str, Any]:
+    """
+    Focused LLM call (model/endpoint from doit.cfg, like answer_howto_question) that picks WHICH other
+    session a cross-session reference means and WHICH of its turns are relevant. Returns
+    {"pid": str, "relevant_ids": [int], "confident": bool}; empty/!confident on any failure so the
+    caller falls back to a clarifying menu.
+    """
+    model_name, api_base, tool_calling = load_config()
+    user_content = (
+        f'User instruction: "{instruction}"\n\n'
+        f"Other terminal sessions (each: pid, working directory, recency, recent commands):\n"
+        f"{sessions_summary}"
+    )
+    completion_params = {
+        "model": model_name,
+        "api_base": api_base,
+        "messages": [
+            {"role": "system", "content": CROSS_SESSION_RESOLVER_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    if not tool_calling and not is_openai_model(model_name):
+        completion_params["num_ctx"] = CTX_NUM
+    try:
+        response = litellm.completion(**completion_params)
+        parsed = parse_json_response(response.choices[0].message.content or "")
+        pid = parsed.get("pid")
+        rel = parsed.get("relevant_ids", [])
+        return {
+            "pid": str(pid) if pid not in (None, "") else "",
+            "relevant_ids": [int(x) for x in rel if str(x).strip().lstrip("-").isdigit()],
+            "confident": bool(parsed.get("confident", False)),
+        }
+    except Exception:
+        return {"pid": "", "relevant_ids": [], "confident": False}
 
 
 def explain_command(command: str) -> str:

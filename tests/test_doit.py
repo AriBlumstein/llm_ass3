@@ -70,7 +70,7 @@ def isolate_history(tmp_path, monkeypatch):
     """Automatically isolate all tests from the host's actual history AND memory files."""
     from llm_communicator import history_manager, memory_manager
     test_file = tmp_path / "test_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
     # Memory is a GLOBAL store (~/.doit/memories.json) - isolate it so no test touches the real
     # one, and every BashToolAgent constructed in tests sees an empty store unless it adds memories.
     mem_file = tmp_path / "test_memories.json"
@@ -382,7 +382,7 @@ def test_history_manager_basic_operations(tmp_path, monkeypatch):
     
     # Mock history file path to be in our temp directory
     test_file = tmp_path / "test_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
     
     # Check initial states
     assert history_manager.get_history_metadata() == []
@@ -450,7 +450,7 @@ def test_agent_runs_with_selective_history(mock_execute_bash, mock_completion, t
     from llm_communicator import history_manager
     
     test_file = tmp_path / "test_agent_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
     
     # 1. Setup existing history: 2 turns
     history_manager.append_history_turn("list files", "ls", "file1\nfile2")
@@ -518,7 +518,7 @@ def test_resolve_transitive_dependencies(tmp_path, monkeypatch):
     """Verify that _resolve_transitive_dependencies correctly resolves transitively chained dependencies."""
     from llm_communicator import history_manager
     test_file = tmp_path / "test_transitive_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
 
     # Turn 1: independent
     history_manager.append_history_turn("list files", "ls", "file1\nfile2", relevant_ids=[])
@@ -642,7 +642,7 @@ def test_json_error_parsing(mock_completion, mock_print, tmp_path, monkeypatch):
     """Verify that if the LLM returns JSON with an error key, it parses and prints it correctly."""
     from llm_communicator import history_manager
     test_file = tmp_path / "test_error_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
 
     # Setup mock LLM behavior:
     # First call (analyze_references): returns empty dependency list
@@ -680,7 +680,7 @@ def test_rejection_warning_direct_response(tmp_path, monkeypatch):
     """Verify that if the LLM returns a contextual warning rejection inside a JSON content response, it is printed/logged without execution."""
     from llm_communicator import history_manager
     test_file = tmp_path / "test_rejection_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
 
     # Mock analyze references to return empty dependencies, then direct warning JSON in content
     msg_execute = MockMessage(content='{"response_text": "I do not see any previous command within the current window that applies to this"}')
@@ -767,7 +767,7 @@ def test_case2_self_contained_command_with_context(tmp_path, monkeypatch):
     """Verify that a self-contained command (like 'create a file called klum') is executed even when context exists in the history."""
     from llm_communicator import history_manager
     test_file = tmp_path / "test_case2_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
 
     # 1. Setup existing history: 1 turn (e.g. list files)
     history_manager.append_history_turn("list files in the cwd", "ls -l", "file1\nfile2")
@@ -993,7 +993,7 @@ def test_clarification_folds_answer_into_persisted_prompt(mock_execute_bash, moc
     """The resolved clarification answer is folded into the prompt stored in history."""
     from llm_communicator import history_manager
     test_file = tmp_path / "clar_history.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
 
     clar_call = MockToolCall("call_clar", "ask_user_clarification", {})
     exec_call = MockToolCall("call_exec", "execute_bash_command",
@@ -1219,6 +1219,11 @@ def test_fallback_instruction_documents_suggested_command():
     "how to list hidden files",
     "what's the command to show disk usage",
     "what is the command for listing processes",
+    "how does one make a file executable",       # "does one" - the reported gemma failure
+    "how does someone delete a directory",
+    "how can you find large files",
+    "how should I check disk space",
+    "what's the best way to compress a folder",
 ])
 def test_is_howto_question_matches(text):
     from llm_communicator.tools import is_howto_question
@@ -1231,6 +1236,8 @@ def test_is_howto_question_matches(text):
     "modify it to find files over 1GB",
     "create a file called notes.txt",
     "remove the directory we just made",
+    "how many files are in this directory",      # "how many" - NOT a how-to
+    "how big is this file",
 ])
 def test_is_howto_question_rejects_non_howto(text):
     from llm_communicator.tools import is_howto_question
@@ -1322,7 +1329,7 @@ def test_is_execute_suggestion_request_rejects(text):
 def test_get_latest_suggested_command(tmp_path, monkeypatch):
     from llm_communicator import history_manager
     test_file = tmp_path / "h.jsonl"
-    monkeypatch.setattr(history_manager, "get_history_file_path", lambda: test_file)
+    monkeypatch.setattr(history_manager, "get_history_file_path", lambda *a, **k: test_file)
 
     assert history_manager.get_latest_suggested_command() is None
     history_manager.append_history_turn("q1", "", "ans1", [], suggested_command="ls -la")
@@ -2261,3 +2268,355 @@ def test_output_question_reruns_user_command(mock_execute_bash, mock_completion)
     assert any("ls -lhS" in (m.get("content") or "") for m in agent.conversation_history)
     # ...and the agent re-ran/built on it to answer (no output was ever captured).
     mock_execute_bash.assert_called_once_with("ls -lhS | head -n 1")
+
+
+# =====================================================================
+# SECTION: Multi-window / cross-session referencing
+# =====================================================================
+def _seed_session(h, pid, cwd, turns, last_active="2026-06-30T00:00:00+00:00"):
+    """Create a session folder with its doit.jsonl turns + session.json registry entry."""
+    d = h.get_session_dir(pid)
+    with open(d / "doit.jsonl", "w", encoding="utf-8") as f:
+        for t in turns:
+            f.write(json.dumps(t) + "\n")
+    (d / "session.json").write_text(json.dumps({
+        "pid": pid, "cwd": cwd,
+        "created_at": "2026-01-01T00:00:00+00:00", "last_active_at": last_active,
+    }), encoding="utf-8")
+    return d
+
+
+def _turn(tid, prompt, command, output="", source="doit"):
+    return {"id": tid, "source": source, "hist_n": None, "prompt": prompt, "command": command,
+            "suggested_command": "", "output": output, "relevant_ids": []}
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("list my sessions", True),
+    ("list the shell numbers", True),
+    ("what windows do I have open", True),
+    ("show open terminals", True),
+    ("what are the current sessions", True),       # "are" BEFORE the noun
+    ("what are my current sessions", True),
+    ("what are the other sessions", True),
+    ("how many sessions are there", True),
+    ("other sessions", True),
+    ("list the files", False),
+    ("sort them by date", False),
+    ("do the folder task in the other window", False),   # singular reference, NOT a list
+    ("the other terminal", False),
+])
+def test_is_session_list_query(text, expected):
+    from llm_communicator.tools import is_session_list_query
+    assert is_session_list_query(text) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("do the folder task we did in the other window here", True),
+    ("the other terminal", True),
+    ("do the task from session 12345 here", True),
+    ("in window 2", True),
+    ("of the files listed by the 130909 session, how many are executable", True),  # number-then-keyword
+    ("redo what the 4242 window did here", True),
+    ("sort them by date", False),
+    ("delete that file", False),
+    ("create a folder for each year from 2020 to 2026", False),
+])
+def test_is_cross_session_reference(text, expected):
+    from llm_communicator.tools import is_cross_session_reference
+    assert is_cross_session_reference(text) is expected
+
+
+@pytest.mark.parametrize("text,pid", [
+    ("do the task from session 12345 here", "12345"),
+    ("of the files listed by the 130909 session, how many are executable", "130909"),  # number-then-keyword
+    ("redo what the 4242 window did", "4242"),
+    ("window 2", "2"),
+    ("the other terminal", None),
+    ("create folders 2020 to 2026", None),
+])
+def test_extract_session_pid(text, pid):
+    from llm_communicator.tools import extract_session_pid
+    assert extract_session_pid(text) == pid
+
+
+def test_system_prompt_documents_multi_window():
+    from fixtures import DOIT_SYSTEM_PROMPT
+    low = DOIT_SYSTEM_PROMPT.lower()
+    assert "multi-window" in low or "cross-session" in low
+    assert "other window" in low or "other terminal" in low
+    assert "re-ground" in low
+
+
+def test_session_registry_and_listing(monkeypatch, tmp_path):
+    """Each session is discoverable by PID + cwd; the current one is flagged; others exclude self."""
+    from llm_communicator import history_manager as h
+    monkeypatch.undo()                                    # use the real path functions
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    _seed_session(h, "111", "/home/u/llm", [_turn(1, "list", "ls")])
+    _seed_session(h, "222", "/home/u/docs", [_turn(1, "make years", "mkdir 2020 2021")])
+
+    alls = h.list_sessions()
+    assert {s["pid"] for s in alls} == {"111", "222"}
+    current = [s for s in alls if s["is_current"]]
+    assert len(current) == 1 and current[0]["pid"] == "111"
+    others = h.list_other_sessions()
+    assert {s["pid"] for s in others} == {"222"}
+    assert others[0]["cwd"] == "/home/u/docs"
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_list_sessions_route_is_deterministic(mock_llm, monkeypatch, tmp_path):
+    """'list the shell numbers' lists sessions by PID from the registry - no LLM, no command."""
+    from llm_communicator import history_manager as h
+    import io, contextlib
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    _seed_session(h, "111", "/home/u/llm", [_turn(1, "list", "ls")])
+    _seed_session(h, "222", "/home/u/docs", [_turn(1, "years", "mkdir 2020")])
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        agent.run_single("list the shell numbers")
+    out = buf.getvalue()
+    assert "111" in out and "222" in out
+    mock_llm.assert_not_called()
+
+
+@patch("llm_communicator.llm_bash.resolve_cross_session")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_cross_session_applies_other_window_task(mock_exec, mock_llm, mock_resolve, monkeypatch, tmp_path):
+    """An explicit cross-window reference pulls the other session's task and applies it HERE."""
+    from llm_communicator import history_manager as h
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    _seed_session(h, "111", "/home/u/llm", [])           # current window, empty history
+    _seed_session(h, "222", "/home/u/docs",
+                  [_turn(1, "create a folder for each year from 2020 to 2026",
+                         "mkdir 2020 2021 2022 2023 2024 2025 2026", output="0 (SUCCESS)")])
+
+    # resolver picks session 222 (patched directly: tools.litellm and llm_bash.litellm are the same
+    # module object, so they cannot be mocked separately).
+    mock_resolve.return_value = {"pid": "222", "relevant_ids": [1], "confident": True}
+    # main agent emits the folder-creation command for the CURRENT dir, then the filter judges it.
+    tool_call = MockToolCall("d1", "execute_bash_command",
+                             {"command": "mkdir 2020 2021 2022 2023 2024 2025 2026", "explanation": "year folders"})
+    mock_llm.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call])),
+                            MockResponse(MockMessage(content="DECISION: YES"))]
+    mock_exec.return_value = "[Success]"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("do the same folder task we did in the other window here")
+
+    convo = "\n".join(m.get("content") or "" for m in agent.conversation_history
+                      if isinstance(m.get("content"), str))
+    assert "pid 222" in convo and "mkdir 2020" in convo   # the other window's task was injected
+    mock_resolve.assert_called_once()                      # resolver consulted
+    mock_exec.assert_called_once_with("mkdir 2020 2021 2022 2023 2024 2025 2026")
+
+
+@patch("llm_communicator.llm_bash.resolve_cross_session")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_cross_session_by_explicit_pid_skips_resolver(mock_exec, mock_llm, mock_resolve, monkeypatch, tmp_path):
+    """Referencing a session by its exact PID resolves deterministically - no fuzzy resolver call."""
+    from llm_communicator import history_manager as h
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    _seed_session(h, "111", "/home/u/llm", [])
+    _seed_session(h, "222", "/home/u/docs",
+                  [_turn(1, "create year folders", "mkdir 2020 2021", output="0 (SUCCESS)")])
+
+    # pid-exact -> resolver NOT used; _analyze_references (llm) picks the turn, then gen + filter
+    mock_llm.side_effect = [
+        MockResponse(MockMessage(content='{"relevant_ids": [1]}')),   # _analyze_references over 222
+        MockResponse(MockMessage(tool_calls=[MockToolCall("d1", "execute_bash_command",
+                     {"command": "mkdir 2020 2021", "explanation": "years"})])),
+        MockResponse(MockMessage(content="DECISION: YES")),
+    ]
+    mock_exec.return_value = "[Success]"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("do the folder task from session 222 here")
+
+    mock_resolve.assert_not_called()                       # exact pid -> no fuzzy resolver
+    mock_exec.assert_called_once_with("mkdir 2020 2021")
+
+
+@patch("llm_communicator.llm_bash.resolve_cross_session")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_cross_session_query_number_then_keyword_pid(mock_exec, mock_llm, mock_resolve, monkeypatch, tmp_path):
+    """Regression: 'of the files listed by the 130909 session ...' (number-BEFORE-keyword PID)
+    resolves to that session and injects its listing - NOT a missing-context rejection."""
+    from llm_communicator import history_manager as h
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "131548")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    _seed_session(h, "131548", "/mnt/c/Users/ayb19", [])           # current window, empty
+    ls_out = "-rwxr-xr-x 1 u u 0 a.sh\n-rw-r--r-- 1 u u 0 b.txt\n"
+    _seed_session(h, "130909", "/home/u/llm_ass3",
+                  [_turn(1, "list the files", "ls -la", output=ls_out)])
+
+    # pid-exact (130909) -> no fuzzy resolver; _analyze_references picks the ls turn, then the agent
+    # answers from the injected listing (answer_question, no command run here).
+    mock_llm.side_effect = [
+        MockResponse(MockMessage(content='{"relevant_ids": [1]}')),
+        MockResponse(MockMessage(tool_calls=[MockToolCall("a1", "answer_question",
+                     {"explanation": "1 of them is executable (a.sh).", "suggested_command": ""})])),
+    ]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("of the files listed by the 130909 session, how many of them are executable")
+
+    # Exclude the system message (the rejection phrase lives verbatim in Rule 7 of the prompt).
+    convo = "\n".join(m.get("content") or "" for m in agent.conversation_history
+                      if isinstance(m.get("content"), str) and m.get("role") != "system")
+    assert "pid 130909" in convo and "a.sh" in convo          # the other session's listing was injected
+    assert "I do not see any previous command" not in convo   # NOT the missing-context rejection
+    mock_resolve.assert_not_called()                          # exact pid
+    mock_exec.assert_not_called()                             # answered from the listing, not re-run here
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_cd_hoist_updates_session_registry_cwd(mock_llm, monkeypatch, tmp_path):
+    """A `cd` is applied by the parent shell only AFTER doit exits, so the registry cwd (recorded at
+    the top of the turn) would be stale. The cd-hoist updates session.json to the target immediately,
+    so OTHER windows see this session's new location."""
+    from llm_communicator import history_manager as h
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    target = tmp_path / "proj"
+    target.mkdir()
+    monkeypatch.setenv("DOIT_CD_FILE", str(tmp_path / "cdfile"))   # shell integration active
+
+    tool_call = MockToolCall("d1", "execute_bash_command", {"command": f"cd {target}", "explanation": "go"})
+    mock_llm.side_effect = [MockResponse(MockMessage(tool_calls=[tool_call])),
+                            MockResponse(MockMessage(content="DECISION: NO"))]   # cd doesn't modify fs
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("go to proj")
+
+    meta = h.read_session_meta(h.get_session_dir("111"))
+    assert meta.get("cwd") == str(target)                         # registry reflects the NEW dir
+    assert (tmp_path / "cdfile").read_text() == str(target)       # cd hoisted to the shell too
+
+
+@patch("llm_communicator.llm_bash.resolve_cross_session")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_cross_session_activity_reports_other_window(mock_exec, mock_llm, mock_resolve, monkeypatch, tmp_path):
+    """'what did I do in the other window' reports THAT session's activity (not the current one),
+    deterministically (no command run, no main LLM)."""
+    from llm_communicator import history_manager as h
+    import io, contextlib
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    _seed_session(h, "111", "/home/u/llm", [_turn(1, "list", "ls -la")])      # current window
+    _seed_session(h, "222", "/home/u/docs", [_turn(1, "make years", "mkdir 2020 2021")])
+    mock_resolve.return_value = {"pid": "222", "relevant_ids": [], "confident": True}
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        agent.run_single("what did I do in the other window")
+    out = buf.getvalue()
+
+    assert "222" in out and "mkdir 2020 2021" in out      # reports the OTHER window
+    assert "ls -la" not in out                            # NOT the current window's command
+    mock_exec.assert_not_called()                         # report only - nothing run
+    mock_llm.assert_not_called()                          # deterministic (resolver is patched)
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_output_question_includes_previous_output_when_resolver_links_nothing(mock_llm, monkeypatch, tmp_path):
+    """Output-awareness safety net: a follow-up about previous output ALWAYS gets the most recent
+    command-with-real-output in context, even when the reference resolver links nothing (e.g. it got
+    confused by output-less user-command noise)."""
+    from llm_communicator import history_manager as h
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    seed = [
+        _turn(1, "", "ls", source="user"),            # user noise: no real output
+        _turn(2, "", "git status", source="user"),
+        _turn(3, "", "ls", source="user"),
+        _turn(4, "list largest", "ls -laS",
+              output="--- STDOUT ---\nbig.iso\nrun.sh\n--- RETURN CODE ---\n0 (SUCCESS)"),  # doit, real output
+    ]
+    d = h.get_session_dir("111")
+    (d / "doit.jsonl").write_text("".join(json.dumps(t) + "\n" for t in seed), encoding="utf-8")
+    (d / "session.json").write_text(json.dumps(
+        {"pid": "111", "cwd": "/home/u", "created_at": "x", "last_active_at": "y"}), encoding="utf-8")
+
+    mock_llm.side_effect = [
+        MockResponse(MockMessage(content='{"relevant_ids": []}')),   # resolver links NOTHING
+        MockResponse(MockMessage(tool_calls=[MockToolCall("a1", "answer_question",
+                     {"explanation": "big.iso looks safe to delete.", "suggested_command": ""})])),
+    ]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("which of these looks safe to delete?")
+
+    convo = "\n".join(m.get("content") or "" for m in agent.conversation_history
+                      if isinstance(m.get("content"), str))
+    assert "big.iso" in convo     # the previous doit output is in context despite the resolver linking nothing
+
+
+@patch("llm_communicator.llm_bash.resolve_cross_session")
+@patch("llm_communicator.llm_bash.litellm.completion")
+def test_cross_session_activity_query_in_fallback_mode(mock_llm, mock_resolve, monkeypatch, tmp_path):
+    """In NON-tool-calling mode, 'what command was recently run in session 222' must report session
+    222 (deterministically) - NOT be hijacked by the how-to route's `^what command` pattern."""
+    from llm_communicator import history_manager as h
+    import io, contextlib
+    monkeypatch.undo()
+    monkeypatch.setattr(h, "doit_root", lambda: tmp_path / ".doit")
+    monkeypatch.setenv("DOIT_PPID", "111")
+    monkeypatch.delenv("DOIT_CMD_LOG", raising=False)
+    monkeypatch.delenv("DOIT_SHELL_HISTORY", raising=False)
+    _seed_session(h, "111", "/home/u/llm", [])
+    _seed_session(h, "222", "/mnt/c", [_turn(1, "make years", "mkdir 2020 2021")])
+
+    with patch("llm_communicator.llm_bash.load_config", return_value=("ollama/gemma3:4b", None, False)):
+        agent = BashToolAgent()
+    assert agent.tool_calling is False
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        agent.run_single("what command was recently run in session 222")
+    out = buf.getvalue()
+
+    assert "222" in out and "mkdir 2020 2021" in out   # reported the target session's command
+    mock_llm.assert_not_called()                        # deterministic report - no main LLM
+    mock_resolve.assert_not_called()                    # exact pid - no fuzzy resolver

@@ -128,6 +128,13 @@ RULES OF BEHAVIOR:
      - If repeating the command would MODIFY the file system or state (it wrote, created, deleted, or moved something), do NOT re-run it; explain from the command text and exit status instead.
    - Any command you generate here still passes the normal filesystem-modification safety check, so when in doubt prefer a read-only query.
 
+12. MULTI-WINDOW / CROSS-SESSION AWARENESS:
+   - You run inside ONE terminal session (identified by its shell PID) with its own history, grounded in the CURRENT DIRECTORY shown. The user may have OTHER terminal windows open, each with its own SEPARATE history.
+   - By DEFAULT, only use THIS session's history. A plain follow-up ("sort them by date", "delete that") refers to THIS window's commands only - never reach into another window's history for it.
+   - Use another session's history ONLY when the user EXPLICITLY references another window/terminal/session (e.g. "the other terminal", "session 12345", "the folder task we did in the other window"). When that happens, the relevant turns from that other session are provided to you, tagged "[from your other session (pid ...) in <dir>]".
+   - RE-GROUND a task pulled from another session in the CURRENT directory: generate the command to run HERE (under the current cwd), and do NOT reuse the other session's working directory or absolute paths. For example, applying "create a folder for each year 2020-2026" from another window means creating those folders in the CURRENT directory.
+   - BUT if the user is ASKING ABOUT the other session's output/result (e.g. "of the files listed in the 12345 session, how many are executable?", "what did that command print?"), the relevant turns - including their captured output - are provided to you; ANSWER from THAT output. Do NOT re-run the command in the current directory (that would query the wrong place); the data refers to the other session's directory, not yours.
+
 GENERAL WARNING ON TOOL USAGE:
    - You must never use tools (such as generating `echo` or `printf` commands) as a workaround to answer conversational questions, capability inquiries, irrelevant inputs, or safety/impossible prompts. If a prompt should not be executed as a command, you MUST NOT call the tool. Calling the tool for these requests is a critical system failure. You must return a JSON response directly containing the response_text.
 """
@@ -198,6 +205,24 @@ Rules:
 - Store ONLY durable facts/preferences or directives that should change FUTURE behavior - for example: "~/school/llms/ass3 is the user's LLM class project folder", "the user prefers sorting by modification time", "when sorting, always ask the user about the order". Do NOT store one-off commands, transient state, or command output.
 - The user's LATEST instruction is authoritative. If it CHANGES or CONTRADICTS an existing memory (e.g. "I changed my mind...", "actually...", "no, that was...", "from now on..."), UPDATE or DELETE the affected memory by its id so the newest information wins - do NOT leave two contradictory memories, and do NOT add a duplicate.
 - Write each memory as a concise, self-contained sentence that still makes sense in a brand-new session. Resolve relative references ("this folder") to an absolute path when one is available (e.g. from the command just executed).
+- Output ONLY the JSON object - no commentary, no markdown.
+"""
+
+CROSS_SESSION_RESOLVER_PROMPT = """The user is working in MULTIPLE terminal windows, each its own session identified by a shell PID, each with its own command history. The user's current instruction EXPLICITLY refers to a DIFFERENT window/session (e.g. "the other terminal", "session 12345", "the folder task we did in the other window"). Your job is to pick WHICH other session it means and WHICH of that session's recent turns are relevant.
+
+You are given the instruction and a numbered list of the OTHER sessions - each with its pid, working directory, recency, and a few recent commands.
+
+Respond with ONLY a raw JSON object and nothing else:
+{
+  "pid": <the shell pid of the chosen session, or null if you cannot tell>,
+  "relevant_ids": [<ids of that session's turns the user is referring to; the recent task they mean>],
+  "confident": <true only if exactly one session clearly matches; false if it is ambiguous>
+}
+
+Rules:
+- Match on the user's cue: an explicit "session/window <pid>" -> that pid; "the other terminal/window" with only one other session -> that one (prefer the most recently active / still-open); a described task ("the folder task", "where I created the folders") -> the session whose recent commands match that description.
+- Set "confident": false when more than one session plausibly matches (the caller will then ask the user to choose). Do NOT guess between equally plausible sessions.
+- "relevant_ids" should be the turn ids (from the chosen session) for the referenced task; [] if you cannot identify specific turns.
 - Output ONLY the JSON object - no commentary, no markdown.
 """
 

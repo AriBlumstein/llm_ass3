@@ -31,6 +31,14 @@ from llm_communicator.tools import (
     explain_command,
     parse_json_response,
     is_openai_model,
+    is_session_list_query,
+    is_cross_session_reference,
+    extract_session_pid,
+    resolve_cross_session,
+    format_sessions_summary,
+    format_sessions_menu,
+    ask_clarification,
+    _ago,
     NO_ANSWER_SENTINEL,
     EXECUTE_TOOL_DEF,
     ANSWER_TOOL_DEF,
@@ -65,6 +73,42 @@ HISTORY_SYSYEM_INSTRUCTION = (
     "Note: The recent command history is presented below from most recent to oldest."
 )
 
+
+
+# Cheap heuristic: does the instruction look like a follow-up that references prior context? Used to
+# (a) short-circuit obviously-independent instructions before the LLM reference resolver, and (b)
+# guarantee the previous command's output is replayed for output-awareness follow-ups.
+CONTEXT_INDICATORS = [
+    "it", "them", "that", "those", "this", "these", "like", "mean", "meant", "the command",
+    "the output", "the results", "re-run", "recursively", "again", "previous", "we just", "before",
+    "output", "results", "we listed", "we created", "we did", "we ran", "we made", "above", "how many",
+    "execute", "run it", "run that", "modify", "do it",
+    # references to the user's own recent actions (user-awareness)
+    "i just", "i made", "i created", "i ran", "i deleted", "i removed", "i added",
+    "the file", "the folder", "the directory", "the dir",
+    # "what did you/I just do" style questions about the most recent action
+    "you just", "did you", "did i", "just do", "what did",
+    # output-awareness questions ABOUT a previous command's output/result/failure
+    "safe to", "why did", "what was", "what does", "error", "fail", "failed", "biggest",
+    "largest", "smallest", "safe", "dangerous", "risky",
+]
+_WORD_BOUNDED_INDICATORS = {
+    "it", "them", "that", "those", "this", "these", "like", "mean", "meant",
+    "again", "before", "previous", "above", "safe", "risky",
+}
+
+
+def instruction_has_context_indicator(instruction: str) -> bool:
+    """True when the instruction contains a word/phrase suggesting it refers to prior context (a
+    follow-up), e.g. 'these', 'that command', 'the output', 'why did ... fail'."""
+    il = (instruction or "").lower()
+    for ind in CONTEXT_INDICATORS:
+        if ind in _WORD_BOUNDED_INDICATORS:
+            if re.search(r"\b" + re.escape(ind) + r"\b", il):
+                return True
+        elif ind in il:
+            return True
+    return False
 
 
 def _persist_prompt(instruction: str, clar_log: List[tuple]) -> str:
@@ -152,34 +196,8 @@ class BashToolAgent:
         if not history_metadata:
             return []
 
-        # Quick heuristic check for independent instructions to assist small models
-        instruction_lower = instruction.lower()
-        context_indicators = [
-            "it", "them", "that", "those", "this", "these", "like", "mean", "meant", "the command",
-            "the output", "the results", "re-run", "recursively", "again", "previous", "we just", "before",
-            "output", "results", "we listed", "we created", "we did", "we ran", "we made", "above", "how many",
-            "execute", "run it", "run that", "modify", "do it",
-            # references to the user's own recent actions (user-awareness)
-            "i just", "i made", "i created", "i ran", "i deleted", "i removed", "i added",
-            "the file", "the folder", "the directory", "the dir",
-            # "what did you/I just do" style questions about the most recent action
-            "you just", "did you", "did i", "just do", "what did",
-            # output-awareness questions ABOUT a previous command's output/result/failure
-            "safe to", "why did", "what was", "what does", "error", "fail", "failed", "biggest",
-            "largest", "smallest",
-        ]
-        has_context_indicator = False
-        for indicator in context_indicators:
-            if indicator in ("it", "them", "that", "those", "this", "these", "like", "mean", "meant", "again", "before", "previous", "above"):
-                if re.search(r'\b' + re.escape(indicator) + r'\b', instruction_lower):
-                    has_context_indicator = True
-                    break
-            else:
-                if indicator in instruction_lower:
-                    has_context_indicator = True
-                    break
-
-        if not has_context_indicator:
+        # Quick heuristic check for independent instructions to assist small models.
+        if not instruction_has_context_indicator(instruction):
             return []
 
         formatted_history = "\n".join([
@@ -474,6 +492,10 @@ class BashToolAgent:
                 with open(cd_file, "w", encoding="utf-8") as f:
                     f.write(abspath)
                 print(f"[doit] changed directory to {abspath}")
+                # The shell will apply this `cd` only AFTER doit exits, so the registry cwd recorded
+                # at the top of this turn (os.getcwd(), the pre-cd dir) is now stale. Update it to the
+                # target so OTHER windows immediately see this session's new location.
+                history_manager.write_session_meta(cwd=abspath)
             except Exception as e:
                 print(f"[doit] could not record directory change: {e}")
         else:
@@ -565,10 +587,141 @@ class BashToolAgent:
             return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF, CLARIFY_TOOL_DEF]
         return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF]
 
+    def _format_session_list(self) -> str:
+        """Human-readable listing of all known terminal sessions (for the 'list the shell numbers'
+        route): each by shell PID + directory + recency + live/closed/this-window tag."""
+        sessions = history_manager.list_sessions()
+        if not sessions:
+            return "No terminal sessions on record yet."
+        lines = ["Your terminal sessions (shell PID - directory - last active):"]
+        for s in sessions:
+            alive = s.get("alive")
+            tag = "this window" if s.get("is_current") else ("live" if alive else ("closed" if alive is False else ""))
+            meta = ", ".join(x for x in (_ago(s.get("last_active_at")), tag) if x)
+            lines.append(f"  pid {s.get('pid')} - {s.get('cwd') or '(unknown dir)'}"
+                         + (f" ({meta})" if meta else ""))
+        return "\n".join(lines)
+
+    def _match_session_answer(self, answer, others, options):
+        """Map a clarification answer (a chosen menu option, a typed pid, or a cwd) back to a session."""
+        if not answer or answer == NO_ANSWER_SENTINEL:
+            return None
+        for s, opt in zip(others, options):
+            if answer == opt:
+                return s
+        pid = extract_session_pid(answer) or "".join(ch for ch in answer if ch.isdigit())
+        for s in others:
+            if pid and s.get("pid") == pid:
+                return s
+        for s in others:
+            if s.get("cwd") and s["cwd"] in answer:
+                return s
+        return None
+
+    def _resolve_target_session(self, instruction: str):
+        """
+        Resolve an EXPLICIT cross-window reference to a target session. Strategy (per spec): an
+        explicit pid -> that session; else the CrossSessionResolver picks one (content/recency); else
+        the single other session; else a clarifying menu. Returns (target_session_dict, resolver_ids)
+        - (None, []) when there are no other sessions or the target can't be determined.
+        """
+        others = history_manager.list_other_sessions()
+        if not others:
+            print("[doit] No other terminal sessions found to reference.")
+            return None, []
+        known = {s["pid"]: s for s in others}
+
+        pid_hint = extract_session_pid(instruction)
+        if pid_hint and pid_hint in known:
+            return known[pid_hint], []                    # exact pid -> deterministic
+
+        res = resolve_cross_session(instruction, format_sessions_summary(others))
+        if res["pid"] in known and (res["confident"] or len(others) == 1):
+            return known[res["pid"]], res["relevant_ids"]
+        if len(others) == 1:
+            return others[0], res.get("relevant_ids", [])
+
+        options = format_sessions_menu(others)            # ambiguous -> ask the user to choose
+        answer = ask_clarification("Which terminal session do you mean?", options)
+        target = self._match_session_answer(answer, others, options)
+        if target is None:
+            print("[doit] Could not determine which session you meant.")
+        return target, []
+
+    def _answer_cross_session_activity(self, instruction: str):
+        """
+        Report what was done in ANOTHER window (a cross-session "what did I do in the other window"
+        query): resolve the target session and list its recent activity from that session's history -
+        no LLM beyond resolution, no command run. Returns the report string, or None if no target
+        could be resolved (so the caller falls back to the current-session activity report).
+        """
+        target, _ = self._resolve_target_session(instruction)
+        if target is None:
+            return None
+        target_dir = history_manager.get_session_dir(target["pid"])
+        items = [t for t in history_manager.get_history_metadata(limit=20, session_dir=target_dir)
+                 if t.get("command")]
+        deduped: List[Dict[str, Any]] = []
+        for t in items:
+            if deduped and deduped[-1]["command"] == t["command"] and deduped[-1].get("source") == t.get("source"):
+                continue
+            deduped.append(t)
+        items = deduped[-6:]
+        cwd = target.get("cwd") or "(unknown dir)"
+        if not items:
+            return f"Your other session (pid {target['pid']}, {cwd}) has no recorded activity."
+        lines = [f"In your other session (pid {target['pid']}, {cwd}):",
+                 f"Most recent: {items[-1]['command']}"]
+        if len(items) > 1:
+            lines.append("Recent activity (oldest to newest):")
+            for t in items:
+                who = "you ran" if t.get("source") == "user" else "doit ran"
+                lines.append(f"  - {who}: {t['command']}")
+        return "\n".join(lines)
+
+    def _resolve_cross_session_turns(self, instruction: str) -> List[str]:
+        """
+        Resolve an EXPLICIT cross-window reference to another session's relevant turns, returned as
+        tagged replay notes. Relevant turn ids come from the resolver, else `_analyze_references` over
+        the target session, else its most recent commands. Empty list if nothing usable.
+        """
+        target, res_ids = self._resolve_target_session(instruction)
+        if target is None:
+            return []
+
+        target_dir = history_manager.get_session_dir(target["pid"])
+        target_meta = history_manager.get_history_metadata(limit=LLM_CONTEXT_LIMIT, session_dir=target_dir)
+        valid = {m["id"] for m in target_meta}
+        ids = [i for i in res_ids if i in valid]
+        if not ids:
+            ids = [i for i in self._analyze_references(instruction, target_meta) if i in valid]
+        if not ids:
+            ids = [m["id"] for m in target_meta if m.get("command")][-3:]
+
+        cwd = target.get("cwd") or "(unknown dir)"
+        notes: List[str] = []
+        for t in history_manager.get_full_turns(ids, session_dir=target_dir):
+            out = t.get("output", "")
+            if out and len(out) > 2000:
+                out = out[:2000] + "\n... [truncated]"
+            note = f'[from your other terminal session (pid {target["pid"]}) in {cwd}]: "{t.get("prompt", "")}"'
+            cmd = t.get("command") or t.get("suggested_command")
+            if cmd:
+                note += f" -> ran `{cmd}`"
+            if out:
+                note += f"\n{out}"
+            notes.append(note)
+        _debug("CROSS-SESSION: target pid", target["pid"], "ids", ids)
+        return notes
+
     def run_single(self, instruction: str) -> None:
         """
         Coordinates a single user query execution.
         """
+        # 0. Record/refresh this session's registry entry (pid, cwd, last-active) so OTHER windows can
+        # discover and reference it. Best-effort, every path.
+        history_manager.write_session_meta()
+
         # 0a. User awareness: import the user's manual shell commands (since the last turn) into the
         # per-session history as source="user" turns, so doit is aware of what the user did directly
         # and in what order relative to its own actions. Runs first, on every path.
@@ -581,6 +734,16 @@ class BashToolAgent:
         activity_subject = is_activity_query(instruction)
         if activity_subject is not None:
             _debug("ACTIVITY-QUERY route:", activity_subject)
+            # If the activity question EXPLICITLY targets another window ("what did I do in the other
+            # window", "what did I run in session 12345"), report THAT session instead of this one.
+            # Falls back to the current-session report when no other session can be resolved.
+            if is_cross_session_reference(instruction):
+                _debug("CROSS-SESSION ACTIVITY route")
+                cross_answer = self._answer_cross_session_activity(instruction)
+                if cross_answer is not None:
+                    print(cross_answer)
+                    history_manager.append_history_turn(instruction, "", cross_answer, [])
+                    return
             # "explain ..." wants an explanation of the recent command (focused sub-call); a plain
             # "what did ..." wants a report (no LLM). Either way, no command is run to find out.
             if "explain" in instruction.lower():
@@ -591,13 +754,23 @@ class BashToolAgent:
             history_manager.append_history_turn(instruction, "", answer, [])
             return
 
+        # 0a-iii. Deterministic "list my sessions / shell numbers" route (all modes). Answered from
+        # the session registry - no LLM, no command run - so the user can see which shell PID to
+        # reference for cross-window requests.
+        if is_session_list_query(instruction):
+            _debug("SESSION-LIST route")
+            answer = self._format_session_list()
+            print(answer)
+            history_manager.append_history_turn(instruction, "", answer, [])
+            return
+
         # 0. Deterministic how-to route (fallback mode only). Weak non-tool-calling models cannot
         # reliably CLASSIFY a how-to question (they mis-route it to clarification), but they can
         # ANSWER one. So we detect the how-to phrasing in Python and hand it to a focused, single
         # purpose sub-call - no multi-rule prompt, no clarification machinery to copy. The answer
         # is persisted with its suggested_command so a later "execute that" can run it. Native
         # tool-calling models route this correctly via Rule 9, so they keep that path.
-        if not self.tool_calling and is_howto_question(instruction):
+        if not self.tool_calling and is_howto_question(instruction) and not is_cross_session_reference(instruction):
             explanation, suggested = answer_howto_question(instruction)
             _debug("HOWTO route:", repr(explanation), "| suggested:", repr(suggested))
             print(explanation)
@@ -625,15 +798,32 @@ class BashToolAgent:
                 return
             _debug("EXECUTE-SUGGESTION route: no prior suggested_command; falling through")
 
-        # 1. Fetch metadata for last 20 actions from history
-        metadata = history_manager.get_history_metadata(limit=LLM_CONTEXT_LIMIT)
+        # 1-3. Resolve which prior turns to replay. An EXPLICIT cross-window reference ("the other
+        # terminal", "session 12345", "the folder task we did in the other window") pulls the relevant
+        # turns from ANOTHER session and, by design, does NOT mix in this window's history (the
+        # reference is explicitly elsewhere). Otherwise we resolve within THIS session only - the
+        # default that keeps windows isolated.
+        cross_session_notes: List[str] = []
+        if is_cross_session_reference(instruction):
+            _debug("CROSS-SESSION route")
+            cross_session_notes = self._resolve_cross_session_turns(instruction)
 
-        # 2. Query LLM to identify relevant previous turns
-        llm_relevant_ids = self._analyze_references(instruction, metadata)
-        relevant_ids = self._resolve_transitive_dependencies(llm_relevant_ids)
-
-        # 3. Retrieve full records of identified relevant turns
-        relevant_turns = history_manager.get_full_turns(relevant_ids)
+        if cross_session_notes:
+            llm_relevant_ids = []
+            relevant_turns = []
+        else:
+            metadata = history_manager.get_history_metadata(limit=LLM_CONTEXT_LIMIT)
+            llm_relevant_ids = self._analyze_references(instruction, metadata)
+            relevant_ids = self._resolve_transitive_dependencies(llm_relevant_ids)
+            # Output-awareness safety net: for a follow-up, ALWAYS make the most recent command that
+            # has real output available, so "why did that fail?" / "which of these is safe to delete?"
+            # work even if the resolver linked nothing (or an output-less user command). Deterministic;
+            # independent instructions (no context indicator) are untouched.
+            if instruction_has_context_indicator(instruction):
+                latest_out = history_manager.get_latest_output_turn_id()
+                if latest_out is not None and latest_out not in relevant_ids:
+                    relevant_ids = sorted(relevant_ids + [latest_out])
+            relevant_turns = history_manager.get_full_turns(relevant_ids)
 
         # 4. Reconstruct conversation history starting with system prompt. Append the user-awareness
         # block (current directory + recent terminal activity) to the system message - built per-run
@@ -730,7 +920,12 @@ class BashToolAgent:
                         "role": "assistant",
                         "content": output
                     })
-            
+
+            # Cross-session context: turns pulled from ANOTHER window, tagged, injected right before
+            # the instruction so the agent applies the task HERE (Rule 12 re-grounds in the cwd).
+            for note in cross_session_notes:
+                self.conversation_history.append({"role": "user", "content": note})
+
             # Append the user's current instruction
             self.conversation_history.append({
                 "role": "user",
@@ -807,7 +1002,11 @@ class BashToolAgent:
                         "content": output
                     })
                     user_content = ""
-            
+
+            # Cross-session context (folded into the running user message so alternation is preserved).
+            for note in cross_session_notes:
+                user_content = (user_content + "\n\n" + note) if user_content else note
+
             if user_content:
                 user_content += f"\n\n{instruction}"
             else:

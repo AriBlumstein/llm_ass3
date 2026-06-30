@@ -98,6 +98,27 @@ Attribution follows what you say: "what did **you/we** just do" refers to doit's
 action, "the command **I** just did" to your last command, and an unqualified "that" / "the
 previous command" to whichever ran most recently.
 
+## Multi-window — working across several terminals
+
+Each terminal window is its own session, identified by its **shell PID**, with its own
+history. By default windows are fully isolated: a follow-up like `doit "sort them by date"`
+in one window only ever refers to *that* window's commands — never another's.
+
+When you *do* want to reach across windows, reference another one explicitly:
+
+```bash
+doit "list the shell numbers"          # see your open windows: pid — directory — last active
+doit "do the folder task we did in the other window here"
+doit "redo what I ran in session 12345 here"
+```
+
+doit finds the right window by its **PID** (exact), or — for fuzzy references like "the
+other terminal" / "the folder task" — by recency and by matching the described task across
+your other sessions, asking you to pick from a numbered list if it's unsure. It then applies
+that task in your **current** directory (it re-grounds the commands here; it doesn't reuse the
+other window's paths), through the usual safety check. The shell PID is the stable handle —
+you can always see a window's own with `echo $$`.
+
 ### How it stays cross-platform
 
 `uv` runs a native Python interpreter, which on Windows cannot execute a POSIX
