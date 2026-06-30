@@ -1,0 +1,219 @@
+// Doit Agent Context: Tool Use Scenario (Multi-Turn Stage 8 - multi-step command plans)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = true).
+// Stage 8 carries over everything from Stage 7 (multi-window) and adds MULTI-STEP COMMAND PLANS as a
+// new TERMINAL ACTION of DoitToolUseAgent. It adds NO new LLM context: the plan is produced in the
+// SAME generation call (a single `execute_plan` tool call) and then executed DETERMINISTICALLY by
+// `_run_plan` - there is no model in the execution loop (the plan is FIXED, not re-prompted per step).
+//
+// So every LLM context is EXACTLY as in Stage 7 - ExplainCommand, CrossSessionResolver,
+// HistoryReferenceResolver, DoitToolUseAgent, ClarificationAuthor, BashFilter, MemoryManager. The only
+// changes are inside DoitToolUseAgent: `sys.tools_definition` gains `execute_plan`, and the set of
+// terminal actions gains one (-> ExecutePlan, below). run_single's pipeline is otherwise unchanged.
+//
+// Rule 13 in `sys.doit_system_prompt` (reinforced by contrasting `sys.fewshot_toolcall` examples)
+// selects the tool by USER INTENT: use `execute_plan` when the USER asked for SEVERAL distinct
+// actions (one command per step); use `execute_bash_command` for a single command - including a pipe/
+// `&&` chain that YOU build merely to answer a question or inspect state (Rule 7/11). Tool selection
+// is model-elected, not a deterministic route. Non-tool-calling mode has no plan tool (see
+// non_tool_use.acdl).
+//
+//   Each terminal window is its own session, identified by its shell PID (DOIT_PPID, pinned by
+//       doit-init.sh to the shell's $$). Its folder <repo>/.doit/history_<pid>/ holds doit.jsonl,
+//       cmdlog.tsv, and session.json (the registry: pid, cwd, created_at, last_active_at).
+//   (sync, no LLM) At the TOP of each turn doit refreshes THIS session's session.json (write_session_meta),
+//       so other windows are discoverable by pid + cwd + recency; refreshed AGAIN after a hoisted `cd`
+//       (or a plan that hoists a net `cd`), so other windows see this session's new location.
+//
+// DETERMINISTIC Python checks run BEFORE the main pipeline and can short-circuit (in order):
+//   - activity query (is_activity_query): "what did I/you just do" -> answer from history (no LLM);
+//                                         "explain ..."             -> ExplainCommand sub-call;
+//                                         if it ALSO references another window -> report THAT session's
+//                                         recent activity, no LLM (CrossSessionActivityReport). Then DONE.
+//   - session list (is_session_list_query): "list the shell numbers" / "what are the other sessions"
+//                                         -> report the registry from list_sessions. No LLM. Then DONE.
+//
+// Per user turn @T the LLM contexts are, in order:
+//   0) ExplainCommand            - explains a recent command for an "explain ..." activity query    (unchanged)
+//   1) CrossSessionResolver      - ONLY on an explicit cross-window reference: picks the other session (unchanged)
+//   1') HistoryReferenceResolver - same-session resolver; SKIPPED when a cross-session ref fired     (unchanged)
+//   2) DoitToolUseAgent          - generates/answers; gains the `execute_plan` terminal action       (CHANGED)
+//   3) ClarificationAuthor       - authors the clarifying question; ALSO picks a window (session menu) (unchanged)
+//   4) BashFilter                - judges filesystem modification for a SINGLE command                (unchanged)
+//   5) MemoryManager             - stores/updates/deletes durable memories after the turn            (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Convention: index < @T = prior turn.
+
+
+// 0. ExplainCommand (explain_command) - unchanged from Stage 7.
+ExplainCommand[@T]: {
+    S: {
+        sys.explain_command_prompt
+    }
+
+    U: sys.pid.most_recent_command[@T]
+}
+
+
+// 0'. CrossSessionActivityReport (_answer_cross_session_activity) - unchanged from Stage 7, no LLM.
+//     An activity query that ALSO references another window resolves the target session
+//     (_resolve_target_session: exact pid, else CrossSessionResolver, else menu) and REPORTS that
+//     session's recent command-bearing turns straight from its doit.jsonl. Deterministic. Then DONE.
+
+
+// 1. CrossSessionResolver (resolve_cross_session) - unchanged from Stage 7.
+//    Fires ONLY when is_cross_session_reference matched, >=1 other session exists, and it is not an
+//    exact pid (an explicit "session <pid>" resolves deterministically, no LLM). Picks the other window
+//    and its relevant turns; not-confident -> session menu via ClarificationAuthor (step 3).
+CrossSessionResolver[@T]: {
+    S: {
+        sys.cross_session_resolver_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.other_sessions_summary[@T]          // numbered: each other session's pid, cwd, last-active, recent commands (with ids)
+    }
+    // -> (pid, relevant_ids, confident) The resolved turns are read from that session's doit.jsonl.
+}
+
+
+// 1'. HistoryReferenceResolver (_analyze_references) - unchanged from Stage 7.
+//     SAME-session resolver. SKIPPED entirely when a cross-session reference fired.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // states the attribution defaults (you/we -> doit, I -> user, bare -> most recent)
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]
+    }
+}
+
+
+// 2. DoitToolUseAgent - CHANGED vs Stage 7.
+//    `sys.tools_definition` now ALSO offers `execute_plan` (PLAN_TOOL_DEF). The system prompt's Rule 13
+//    and a contrasting `sys.fewshot_toolcall` plan example teach the agent to ELECT `execute_plan` when
+//    the USER asked for several distinct actions. Context assembly (memory, activity, cross-session vs
+//    same-session replay, clarification rounds) is IDENTICAL to Stage 7 - only the terminal action set
+//    grows. A prior PLAN turn replays as a single `execute_bash_command` tool call whose `command` is the
+//    step commands joined with "; " (history stores no separate plan structure).
+DoitToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // carries Rule 12 (multi-window, Stage 7) and Rule 13 (multi-step plans, Stage 8)
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]
+        }
+        sys.activity_block[@T]                  // CURRENT DIRECTORY + recent [user]/[doit] activity (this session)
+        sys.tools_definition                    // execute_bash_command, answer_question, ask_user_clarification, execute_plan (NEW)
+    }
+
+    ForEach(@d: sys.fewshot_toolcall) {         // now ALSO includes an execute_plan demonstration (Rule 13)
+        U: sys.fewshot_toolcall[@d].instruction
+        A: sys.fewshot_toolcall[@d].tool_call
+        T: sys.fewshot_toolcall[@d].result
+    }
+
+    If(resp.pid.cross_session_resolver[@T].matched) {
+        // Cross-session: relevant turns from the CHOSEN other session, tagged, injected as plain notes.
+        ForEach(@x: resp.pid.cross_session_resolver[@T].relevant_ids) {
+            U: cross_session_note(sys.other.turn[@x])   // "[from your other terminal session (pid ...) in <cwd>]: \"<prompt>\" -> ran `<command>`\n<output>"
+        }
+    } Else {
+        // Same-session replay (Stage 6/7 behavior): doit turns as tool call+result; user turns as notes.
+        // OUTPUT-AWARENESS SAFETY NET: for a follow-up (instruction_has_context_indicator), the replayed
+        // ids ALSO always include get_latest_output_turn_id() (the most recent doit turn with real output).
+        ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids + sys.pid.latest_output_turn[@T]) {
+            If(sys.pid.turn[@t].source == "user") {
+                U: user_ran_note(sys.pid.turn[@t].command, sys.pid.turn[@t].output)
+            } Else {
+                U: sys.pid.turn[@t].prompt
+                If(sys.pid.turn[@t].command != "") {     // a prior PLAN replays here too: command = steps joined "; "
+                    A: sys.pid.tool_call[@t]
+                    T: sys.pid.turn[@t].output
+                } Else {
+                    If(sys.pid.turn[@t].suggested_command != "") {
+                        A: sys.pid.answer_call[@t]
+                        T: sys.answer_delivered_notice
+                    } Else {
+                        A: sys.pid.turn[@t].output
+                    }
+                }
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    ForEach(i: pid.clarification_steps[@T]) {
+        If(resp.pid.doit_tool_use_agent[@T.i].asks_clarification) {
+            A: resp.pid.doit_tool_use_agent[@T.i].ask_user_clarification_call
+            T: env.user_clarification_answer[@T.i]
+        }
+    }
+    // Terminal action (model-elected) is ONE of:
+    //   - execute_bash_command   -> a single command           (-> BashFilter, then hoisted if cd/session-state else run)
+    //   - execute_plan           -> a multi-step plan          (-> ExecutePlan; its OWN plan-level [y/N], NOT BashFilter)   NEW
+    //   - answer_question        -> explain / suggest a command, not executed
+    //   - ask_user_clarification -> ask a clarifying question (final round withdraws it)
+    //   - plain text             -> rejections / conversational replies
+    // A cross-session task is re-grounded in the CURRENT cwd (Rule 12).
+}
+
+
+// 2'. Plan execution (_run_plan) - NEW in Stage 8. DETERMINISTIC, NO LLM, so it is NOT an ACDL context
+//     (no messages array, no model call) - described here in prose only, like CrossSessionActivityReport.
+//     When DoitToolUseAgent elects `execute_plan`, its single tool call carries
+//     ( overview?: str, steps: [ ( command: str, explanation: str ) ] ). `_run_plan` then, with no
+//     further model calls: (1) SHOWS the whole plan (overview + numbered command/explanation list);
+//     (2) asks ONE "Run this N-step plan? [y/N]" - declined -> nothing runs (this plan-level consent
+//     replaces the per-command BashFilter LLM judge: a plan does NOT pass through BashFilter); (3) runs
+//     the steps IN ORDER, each via execute_bash (the regex BANNED_COMMAND_PATTERNS blacklist still
+//     applies); (4) STOPS at the first failed step (_plan_step_failed), skipping the rest. A standalone
+//     `cd` is tracked (resolve_cd_target, validated with os.path.isdir - not subprocessed) and
+//     session-state builtins accumulate as a prelude for later steps; on success the net cwd/shell-state
+//     are hoisted to the parent shell (_hoist_cd/_hoist_shell). The transcript is stored as the turn's
+//     output, with executed_command = the step commands joined with "; ".
+
+
+// 3. ClarificationAuthor (_author_clarification) - unchanged from Stage 7.
+//    Authors a clarifying question for an ambiguous instruction; ALSO reused (with a prebuilt session
+//    menu, no LLM authoring) to let the user pick which window when CrossSessionResolver is unsure.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 4. BashFilter (_filter_bash) - unchanged from Stage 7. Vets the SINGLE-command path
+//    (execute_bash_command), hoisted or not. NOTE: the `execute_plan` action does NOT pass through
+//    BashFilter - a plan is gated by its own one-shot plan-level [y/N] (see ExecutePlan).
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction
+        resp.pid.doit_tool_use_agent[@T].tool_call[0].command
+    }
+}
+
+
+// 5. MemoryManager (extract_memories) - unchanged from Stage 7. For a plan, the executed command is the
+//    step commands joined with "; ".
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_tool_use_agent[@T].command
+        sys.memories[@T]
+    }
+}

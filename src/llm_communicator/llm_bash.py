@@ -21,6 +21,7 @@ from llm_communicator.tools import (
     answer_howto_question,
     is_execute_suggestion_request,
     resolve_cd_hoist,
+    resolve_cd_target,
     resolve_session_state_hoist,
     is_memory_candidate,
     extract_memories,
@@ -42,6 +43,7 @@ from llm_communicator.tools import (
     NO_ANSWER_SENTINEL,
     EXECUTE_TOOL_DEF,
     ANSWER_TOOL_DEF,
+    PLAN_TOOL_DEF,
     CLARIFY_TOOL_DEF,
 )
 
@@ -578,14 +580,116 @@ class BashToolAgent:
         except Exception as e:
             return f"[Error: {str(e)}]"
 
+    @staticmethod
+    def _plan_step_failed(result: str) -> bool:
+        """Whether an executed plan step's output indicates failure - so the plan stops instead of
+        cascading. Reads the markers `execute_bash` emits: a non-zero `(FAILED)` return code, an
+        `[Error ...]` marker, or the timeout message."""
+        r = result or ""
+        return ("(FAILED)" in r) or r.lstrip().startswith("[Error") or "Terminated due to exceeding" in r
+
+    def _run_plan(self, steps: List[Dict[str, Any]], overview: str = "") -> str:
+        """
+        Execute a multi-step plan: SHOW the whole plan first (so the user sees what will happen),
+        confirm ONCE, then run the steps IN ORDER, STOPPING at the first failure so a broken step
+        does not cascade. Each step still passes the regex safety blacklist (via execute_bash).
+        Returns a transcript stored as the turn's output.
+        """
+        steps = [s for s in steps if isinstance(s, dict) and s.get("command")]
+        if not steps:
+            return "[Error: the plan had no runnable steps]"
+
+        header = "[PLAN] " + (overview.strip() + "\n" if overview.strip() else "") + \
+                 "The following steps will run in order:"
+        print(header)
+        for i, s in enumerate(steps, 1):
+            expl = s.get("explanation", "")
+            print(f"  {i}. {s['command']}" + (f"   - {expl}" if expl else ""))
+
+        try:
+            choice = input(f"Run this {len(steps)}-step plan? [y/N]: ").strip().lower()
+        except EOFError:
+            choice = ""
+        if choice not in ("y", "yes"):
+            msg = "[Cancelled: User declined the plan]"
+            print(msg)
+            return msg
+
+        transcript: List[str] = []
+        start_cwd = os.getcwd()
+        cwd = start_cwd                  # the plan's running directory (threaded across steps)
+        shell_state: List[str] = []      # accumulated session-state (export/alias/...) for later steps + hoist
+        completed = False
+
+        def _stop(i: int, line: str) -> None:
+            stop = (f"[Plan STOPPED at step {i}/{len(steps)}: it failed, so the remaining "
+                    f"{len(steps) - i} step(s) were NOT run.]")
+            print(line); print(stop)
+            transcript.append(f"[step {i}/{len(steps)}] {steps[i-1]['command']}\n{line}")
+            transcript.append(stop)
+
+        for i, s in enumerate(steps, 1):
+            cmd = s["command"]
+            print(f"\n[STEP {i}/{len(steps)}] {cmd}")
+
+            # Standalone `cd`: no output and pointless to subprocess (discarded), so TRACK it - the plan's
+            # cwd moves for later steps. Validate in Python (a missing dir is a failed step that stops).
+            cd_target = resolve_cd_target(cmd, cwd)
+            if cd_target is not None:
+                if os.path.isdir(cd_target):
+                    cwd = cd_target
+                    line = f"[plan: cd -> {cwd}]"
+                    print(line)
+                    transcript.append(f"[step {i}/{len(steps)}] {cmd}\n{line}")
+                    continue
+                _stop(i, f"[Error: cd: no such directory: {cd_target}]")
+                break
+
+            # Session-state builtin (export/alias/set/...): accumulate; applied to later steps + hoisted.
+            shell_cmd = resolve_session_state_hoist(cmd)
+            if shell_cmd is not None:
+                shell_state.append(shell_cmd)
+                line = f"[plan: shell-state -> {shell_cmd}]"
+                print(line)
+                transcript.append(f"[step {i}/{len(steps)}] {cmd}\n{line}")
+                continue
+
+            # Normal step: run in the plan's cwd with accumulated shell-state applied.
+            try:
+                out = execute_bash(cmd, cwd=cwd, prelude=shell_state or None)
+            except BashSafetyViolationError as safety_err:
+                out = f"[Error: {str(safety_err)}]"
+            except Exception as e:
+                out = f"[Error: {str(e)}]"
+            print(out)
+            transcript.append(f"[step {i}/{len(steps)}] {cmd}\n{out}")
+            if self._plan_step_failed(out):
+                stop = (f"[Plan STOPPED at step {i}/{len(steps)}: it failed, so the remaining "
+                        f"{len(steps) - i} step(s) were NOT run.]")
+                print(stop)
+                transcript.append(stop)
+                break
+        else:
+            completed = True
+            transcript.append(f"[Plan complete: all {len(steps)} steps succeeded.]")
+
+        # Hoist the plan's NET cwd / shell-state to the parent shell (like a single-command hoist), but
+        # only when the plan completed - a failed plan leaves the shell where it was.
+        if completed:
+            if cwd != start_cwd and os.path.isdir(cwd):
+                self._hoist_cd(cwd)
+            if shell_state:
+                self._hoist_shell("; ".join(shell_state))
+        return "\n".join(transcript)
+
     def _build_tools(self, include_clarification: bool) -> List[Dict[str, Any]]:
         """
         Tools offered to the generator. The clarification tool is withdrawn on the final round
         so the model must commit to a command (or an answer) instead of asking again.
         """
         if include_clarification:
-            return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF, CLARIFY_TOOL_DEF]
-        return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF]
+            return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF, PLAN_TOOL_DEF, CLARIFY_TOOL_DEF]
+        return [EXECUTE_TOOL_DEF, ANSWER_TOOL_DEF, PLAN_TOOL_DEF]
 
     def _format_session_list(self) -> str:
         """Human-readable listing of all known terminal sessions (for the 'list the shell numbers'
@@ -1129,6 +1233,30 @@ class BashToolAgent:
                             "name": tool_call.function.name,
                             "content": tool_result
                         })
+                    elif tool_call.function.name == "execute_plan":
+                        # Multi-step plan: show all steps, confirm once, run in order, stop on failure.
+                        try:
+                            args_data = json.loads(tool_call.function.arguments)
+                            steps = args_data.get("steps", [])
+                            overview = args_data.get("overview", "") or ""
+                            executed_command = "; ".join(
+                                s.get("command", "") for s in steps if isinstance(s, dict) and s.get("command")
+                            )
+                            plan_result = self._run_plan(steps, overview)
+                        except json.JSONDecodeError:
+                            plan_result = "[Error: Generated JSON arguments failed structure validation rules]"
+                        except Exception as e:
+                            plan_result = f"[Error: Failed to process plan tool arguments: {str(e)}]"
+
+                        print(f"[RESULT] Plan transcript:\n{plan_result}")
+                        execution_output = plan_result
+
+                        self.conversation_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": plan_result
+                        })
                 handled = True
 
             elif not self.tool_calling and assistant_message.content:
@@ -1165,7 +1293,23 @@ class BashToolAgent:
                     clarifications_used += 1
                     continue
 
-                if not executable:
+                # Multi-step plan (Rule 13) in fallback mode: the JSON carries a `steps` array instead
+                # of a single command. Run it through the SAME plan runner the tool path uses (preview,
+                # one [y/N], in-order, stop-on-failure, cd/shell-state hoisting).
+                plan_steps = parsed.get("steps")
+                if isinstance(plan_steps, list) and any(
+                        isinstance(s, dict) and s.get("command") for s in plan_steps):
+                    overview = parsed.get("overview", "") or ""
+                    executed_command = "; ".join(
+                        s.get("command", "") for s in plan_steps if isinstance(s, dict) and s.get("command"))
+                    execution_output = self._run_plan(plan_steps, overview)
+                    print(f"[RESULT] Plan transcript:\n{execution_output}")
+                    self.conversation_history.append({
+                        "role": "user",
+                        "content": f"Plan execution output:\n{execution_output}"
+                    })
+                    handled = True
+                elif not executable:
                     # A Rule 9 answer carries a suggested_command (not executed); persist it so a
                     # later "execute that" can resolve and run it. Rejections carry neither.
                     if suggested_command:
@@ -1177,24 +1321,24 @@ class BashToolAgent:
                         print(content)
                         history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", content, llm_relevant_ids, suggested_command=suggested_command)
                     return
+                else:
+                    executed_command = command
+                    print(f"[TEXT PARSED] Command: {command}")
+                    print(f"[TEXT PARSED] Explanation: {explanation}")
 
-                executed_command = command
-                print(f"[TEXT PARSED] Command: {command}")
-                print(f"[TEXT PARSED] Explanation: {explanation}")
+                    try:
+                        execution_result = self._dispatch_command(command)
+                    except Exception as e:
+                        execution_result = f"[Error: Fallback JSON parsing/execution failed: {str(e)}]"
 
-                try:
-                    execution_result = self._dispatch_command(command)
-                except Exception as e:
-                    execution_result = f"[Error: Fallback JSON parsing/execution failed: {str(e)}]"
+                    print(f"[RESULT] Shell Response:\n{execution_result}")
+                    execution_output = execution_result
 
-                print(f"[RESULT] Shell Response:\n{execution_result}")
-                execution_output = execution_result
-
-                self.conversation_history.append({
-                    "role": "user",
-                    "content": f"Command execution output:\n{execution_result}"
-                })
-                handled = True
+                    self.conversation_history.append({
+                        "role": "user",
+                        "content": f"Command execution output:\n{execution_result}"
+                    })
+                    handled = True
 
             elif assistant_message.content:
                 _debug("BRANCH: trailing content (tool_calling model returned TEXT, no tool call)")

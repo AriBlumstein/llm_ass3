@@ -609,6 +609,44 @@ def test_cli_no_args_errors_required_argument(monkeypatch, capsys):
     assert "instruction" in capsys.readouterr().err
 
 
+def test_cli_reset_wipes_all_histories_but_keeps_memories(tmp_path, monkeypatch):
+    """`doit --reset` deletes EVERY session's history folder under .doit/ while leaving
+    memories.json (a sibling of the folders, not inside them) untouched, then exits 0."""
+    from doit_module.__main__ import main
+    from llm_communicator import history_manager
+
+    # Build a fake .doit root: two session folders (this window + another) plus the memory file.
+    fake_root = tmp_path / ".doit"
+    (fake_root / "history_111").mkdir(parents=True)
+    (fake_root / "history_111" / "doit.jsonl").write_text('{"id": 1}\n')
+    (fake_root / "history_222").mkdir(parents=True)
+    (fake_root / "history_222" / "cmdlog.tsv").write_text("0\tls\n")
+    memories = fake_root / "memories.json"
+    memories.write_text('[{"id": 1, "content": "my projects dir is ~/projects", "active": true}]')
+
+    monkeypatch.setattr(history_manager, "doit_root", lambda: fake_root)
+    monkeypatch.setattr(sys, "argv", ["doit", "--reset"])
+
+    def mock_exit(code):
+        raise SystemExit(code)
+    monkeypatch.setattr(sys, "exit", mock_exit)
+    print_mock = MagicMock()
+    monkeypatch.setattr("builtins.print", print_mock)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    # All history folders gone...
+    assert not (fake_root / "history_111").exists()
+    assert not (fake_root / "history_222").exists()
+    assert list(fake_root.glob("history_*")) == []
+    # ...but memories survive, byte-for-byte.
+    assert memories.exists()
+    assert "my projects dir" in memories.read_text()
+    print_mock.assert_any_call("Reset complete: cleared history for 2 session(s). Memories were kept.")
+
+
 def test_history_system_instruction_rules():
     """Verify HISTORY_SYSYEM_INSTRUCTION contains the semantic matching, chronological, and safety check rules."""
     from llm_communicator.llm_bash import HISTORY_SYSYEM_INSTRUCTION
@@ -2620,3 +2658,311 @@ def test_cross_session_activity_query_in_fallback_mode(mock_llm, mock_resolve, m
     assert "222" in out and "mkdir 2020 2021" in out   # reported the target session's command
     mock_llm.assert_not_called()                        # deterministic report - no main LLM
     mock_resolve.assert_not_called()                    # exact pid - no fuzzy resolver
+
+
+# =====================================================================
+# SECTION: Multi-step command plans (execute_plan)
+# =====================================================================
+def test_plan_tool_is_offered_in_tool_calling():
+    agent = BashToolAgent(api_key="fake-key")
+    assert "execute_plan" in [t["function"]["name"] for t in agent._build_tools(include_clarification=True)]
+    assert "execute_plan" in [t["function"]["name"] for t in agent._build_tools(include_clarification=False)]
+
+
+def test_system_prompt_documents_plan_rule():
+    from fixtures import DOIT_SYSTEM_PROMPT
+    low = DOIT_SYSTEM_PROMPT.lower()
+    assert "execute_plan" in DOIT_SYSTEM_PROMPT
+    assert "multi-step" in low
+    assert "in sequence" in low
+    assert "stop if" in low
+
+
+_PLAN_STEPS = {"overview": "scaffold a project", "steps": [
+    {"command": "mkdir proj", "explanation": "create the project dir"},
+    {"command": "touch proj/main.py", "explanation": "add an entry file"},
+    {"command": "git -C proj init", "explanation": "initialize git"},
+]}
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_execute_plan_runs_steps_in_order(mock_exec, mock_llm, monkeypatch):
+    """A multi-step plan runs each step IN ORDER (after one confirmation) and records the transcript."""
+    from llm_communicator import history_manager
+    monkeypatch.setenv("DOIT_PPID", "ptest")
+    mock_llm.side_effect = [MockResponse(MockMessage(tool_calls=[MockToolCall("p1", "execute_plan", _PLAN_STEPS)]))]
+    mock_exec.return_value = "[Success]"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("set up a python project")
+
+    assert [c.args[0] for c in mock_exec.call_args_list] == ["mkdir proj", "touch proj/main.py", "git -C proj init"]
+    turn = history_manager.get_history_metadata()[-1]
+    assert turn["command"] == "mkdir proj; touch proj/main.py; git -C proj init"
+    last_out = history_manager.get_full_turns([turn["id"]])[0]["output"]
+    assert "all 3 steps succeeded" in last_out
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_execute_plan_stops_on_failure(mock_exec, mock_llm, monkeypatch):
+    """If a step fails, the plan STOPS - later steps are not run (no cascade)."""
+    from llm_communicator import history_manager
+    monkeypatch.setenv("DOIT_PPID", "ptest2")
+    mock_llm.side_effect = [MockResponse(MockMessage(tool_calls=[MockToolCall("p1", "execute_plan", _PLAN_STEPS)]))]
+    mock_exec.side_effect = ["[Success]", "--- RETURN CODE ---\n1 (FAILED)\n"]   # step 2 fails
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("set up a python project")
+
+    assert [c.args[0] for c in mock_exec.call_args_list] == ["mkdir proj", "touch proj/main.py"]   # step 3 skipped
+    out = history_manager.get_full_turns([history_manager.get_history_metadata()[-1]["id"]])[0]["output"]
+    assert "STOPPED at step 2/3" in out
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_execute_plan_declined_runs_nothing(mock_exec, mock_llm, monkeypatch):
+    """Declining the plan up-front runs no steps at all."""
+    monkeypatch.setenv("DOIT_PPID", "ptest3")
+    mock_llm.side_effect = [MockResponse(MockMessage(tool_calls=[MockToolCall("p1", "execute_plan", _PLAN_STEPS)]))]
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    with patch("builtins.input", return_value="n"):
+        agent.run_single("set up a python project")
+
+    mock_exec.assert_not_called()
+
+
+# =====================================================================
+# SECTION: Command hoisting inside plans (cd / session-state)
+# =====================================================================
+@pytest.mark.parametrize("cmd,base,expected", [
+    ("cd sub", "/a", "/a/sub"),
+    ("cd ..", "/a/b", "/a"),
+    ("cd /x/y", "/a", "/x/y"),
+    ("cd 'my dir'", "/a", "/a/my dir"),
+    ("cd proj && ls", "/a", None),     # compound -> not a standalone cd
+    ("cd -", "/a", None),
+    ("ls", "/a", None),
+])
+def test_resolve_cd_target(cmd, base, expected):
+    from llm_communicator.tools import resolve_cd_target
+    assert resolve_cd_target(cmd, base) == expected
+
+
+def _plan_call(plan):
+    return MockResponse(MockMessage(tool_calls=[MockToolCall("p1", "execute_plan", plan)]))
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_plan_threads_cwd_across_cd(mock_exec, mock_llm, monkeypatch, tmp_path):
+    """A `cd` step moves the plan's cwd for LATER steps; the cd itself is not subprocessed."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "proj").mkdir()                       # so `cd proj` validates (mkdir is mocked)
+    plan = {"steps": [
+        {"command": "mkdir proj", "explanation": "dir"},
+        {"command": "cd proj", "explanation": "enter"},
+        {"command": "touch main.py", "explanation": "file"},
+    ]}
+    mock_llm.side_effect = [_plan_call(plan)]
+    mock_exec.return_value = "[Success]"
+    agent = BashToolAgent(api_key="fake-key"); agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("scaffold")
+
+    by_cmd = {c.args[0]: c.kwargs for c in mock_exec.call_args_list}
+    assert set(by_cmd) == {"mkdir proj", "touch main.py"}        # cd tracked, not executed
+    assert by_cmd["mkdir proj"]["cwd"] == str(tmp_path)          # before the cd
+    assert by_cmd["touch main.py"]["cwd"] == str(tmp_path / "proj")  # after the cd
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_plan_bad_cd_stops(mock_exec, mock_llm, monkeypatch, tmp_path):
+    """A `cd` into a missing directory is a failed step that stops the plan."""
+    from llm_communicator import history_manager
+    monkeypatch.chdir(tmp_path)
+    plan = {"steps": [
+        {"command": "cd nope", "explanation": "enter missing"},
+        {"command": "touch a", "explanation": "file"},
+    ]}
+    mock_llm.side_effect = [_plan_call(plan)]
+    agent = BashToolAgent(api_key="fake-key"); agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("scaffold")
+
+    mock_exec.assert_not_called()                                # nothing ran
+    out = history_manager.get_full_turns([history_manager.get_history_metadata()[-1]["id"]])[0]["output"]
+    assert "no such directory" in out and "STOPPED at step 1/2" in out
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_plan_compound_cd_runs_as_normal_step(mock_exec, mock_llm, monkeypatch, tmp_path):
+    """`cd x && y` is NOT a standalone cd - it runs as one normal subprocess step."""
+    monkeypatch.chdir(tmp_path)
+    plan = {"steps": [{"command": "cd /tmp && ls", "explanation": "compound"}]}
+    mock_llm.side_effect = [_plan_call(plan)]
+    mock_exec.return_value = "[Success]"
+    agent = BashToolAgent(api_key="fake-key"); agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("x")
+    assert [c.args[0] for c in mock_exec.call_args_list] == ["cd /tmp && ls"]
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_plan_export_applies_as_prelude(mock_exec, mock_llm, monkeypatch, tmp_path):
+    """An `export` step is tracked and applied to LATER steps via the prelude (not subprocessed alone)."""
+    monkeypatch.chdir(tmp_path)
+    plan = {"steps": [
+        {"command": "export K=1", "explanation": "set var"},
+        {"command": 'echo "$K"', "explanation": "use var"},
+    ]}
+    mock_llm.side_effect = [_plan_call(plan)]
+    mock_exec.return_value = "[Success]"
+    agent = BashToolAgent(api_key="fake-key"); agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("x")
+    by_cmd = {c.args[0]: c.kwargs for c in mock_exec.call_args_list}
+    assert set(by_cmd) == {'echo "$K"'}                          # export tracked, not executed
+    assert by_cmd['echo "$K"']["prelude"] == ["export K=1"]
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_plan_hoists_final_cwd_and_state(mock_exec, mock_llm, monkeypatch, tmp_path):
+    """On success, the plan's net cwd + session-state are hoisted to the parent shell."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "proj").mkdir()
+    cdfile = tmp_path / "cdfile"; shfile = tmp_path / "shfile"
+    monkeypatch.setenv("DOIT_CD_FILE", str(cdfile))
+    monkeypatch.setenv("DOIT_SHELL_FILE", str(shfile))
+    plan = {"steps": [
+        {"command": "cd proj", "explanation": "enter"},
+        {"command": "export K=1", "explanation": "set"},
+        {"command": "true", "explanation": "noop"},
+    ]}
+    mock_llm.side_effect = [_plan_call(plan)]
+    mock_exec.return_value = "[Success]"
+    agent = BashToolAgent(api_key="fake-key"); agent.tool_calling = True
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("x")
+
+    assert cdfile.read_text() == str(tmp_path / "proj")          # net cwd hoisted
+    assert shfile.read_text() == "export K=1"                    # session-state hoisted
+
+
+# =====================================================================
+# SECTION: Plan-preference guidance (user multi-step vs model chaining)
+# =====================================================================
+def test_rule13_states_intent_test():
+    """Rule 13 distinguishes a user-requested action sequence (-> execute_plan) from chaining/piping
+    to answer a question (-> a single execute_bash_command)."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    low = DOIT_SYSTEM_PROMPT.lower()
+    assert "several distinct actions" in low                 # the "use it" criterion
+    assert "answer a question" in low                        # the "don't use it" exclusion
+    # existing Rule 13 contract still holds
+    assert "execute_plan" in DOIT_SYSTEM_PROMPT
+    assert "multi-step" in low and "in sequence" in low and "stop if" in low
+
+
+def test_fewshot_toolcall_has_plan_and_piped_examples():
+    """The tool-calling few-shots demonstrate BOTH a multi-action request -> execute_plan AND a piped
+    question -> a single execute_bash_command (teaching the Rule 13 boundary)."""
+    from llm_communicator.backup_system_prompts import FEWSHOT_TOOLCALL
+    tool_calls = [tc for m in FEWSHOT_TOOLCALL if m.get("role") == "assistant"
+                  for tc in m.get("tool_calls", [])]
+    names = [tc["function"]["name"] for tc in tool_calls]
+    assert "execute_plan" in names                           # multi-action example
+    # a piped execute_bash_command example exists (a question answered by one piped command)
+    piped = [tc for tc in tool_calls
+             if tc["function"]["name"] == "execute_bash_command" and "|" in tc["function"]["arguments"]]
+    assert piped, "expected a piped execute_bash_command few-shot"
+
+
+# =====================================================================
+# SECTION: Command plans in NON-tool-calling (fallback) mode
+# =====================================================================
+_FALLBACK_PLAN_JSON = ('{"executable": true, "rule_triggered": 13, "overview": "scaffold", '
+                       '"steps": [{"command": "mkdir proj", "explanation": "dir"}, '
+                       '{"command": "touch proj/main.py", "explanation": "file"}, '
+                       '{"command": "git -C proj init", "explanation": "git"}], '
+                       '"command": "", "response_text": ""}')
+
+
+def test_fallback_instruction_documents_steps():
+    from llm_communicator.backup_system_prompts import FALLBACK_SYSTEM_INSTRUCTION
+    assert '"steps"' in FALLBACK_SYSTEM_INSTRUCTION
+    assert "13 for a multi-step plan" in FALLBACK_SYSTEM_INSTRUCTION
+
+
+def test_rule13_fallback_clause_uses_steps():
+    from fixtures import DOIT_SYSTEM_PROMPT
+    low = DOIT_SYSTEM_PROMPT.lower()
+    assert "non-tool-calling mode" in low and "`steps`" in DOIT_SYSTEM_PROMPT
+
+
+def test_fewshot_fallback_has_steps_example():
+    from llm_communicator.backup_system_prompts import FEWSHOT_FALLBACK
+    assert any('"steps"' in m.get("content", "") for m in FEWSHOT_FALLBACK if m.get("role") == "assistant")
+
+
+@patch("llm_communicator.llm_bash.load_config", return_value=("ollama/qwen3:4b-instruct", None, False))
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_plan_runs_in_order(mock_exec, mock_llm, mock_cfg, monkeypatch):
+    """A fallback-JSON `steps` array runs through the same plan runner, in order."""
+    from llm_communicator import history_manager
+    monkeypatch.setenv("DOIT_PPID", "fbplan1")
+    mock_llm.side_effect = [MockResponse(MockMessage(content=_FALLBACK_PLAN_JSON))]
+    mock_exec.return_value = "[Success]"
+
+    agent = BashToolAgent()
+    assert agent.tool_calling is False
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("set up a python project")
+
+    assert [c.args[0] for c in mock_exec.call_args_list] == ["mkdir proj", "touch proj/main.py", "git -C proj init"]
+    turn = history_manager.get_history_metadata()[-1]
+    assert turn["command"] == "mkdir proj; touch proj/main.py; git -C proj init"
+    assert "all 3 steps succeeded" in history_manager.get_full_turns([turn["id"]])[0]["output"]
+
+
+@patch("llm_communicator.llm_bash.load_config", return_value=("ollama/qwen3:4b-instruct", None, False))
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_plan_stops_on_failure(mock_exec, mock_llm, mock_cfg, monkeypatch):
+    from llm_communicator import history_manager
+    monkeypatch.setenv("DOIT_PPID", "fbplan2")
+    mock_llm.side_effect = [MockResponse(MockMessage(content=_FALLBACK_PLAN_JSON))]
+    mock_exec.side_effect = ["[Success]", "--- RETURN CODE ---\n1 (FAILED)\n"]   # step 2 fails
+
+    agent = BashToolAgent()
+    with patch("builtins.input", return_value="y"):
+        agent.run_single("set up a python project")
+
+    assert [c.args[0] for c in mock_exec.call_args_list] == ["mkdir proj", "touch proj/main.py"]   # step 3 skipped
+    out = history_manager.get_full_turns([history_manager.get_history_metadata()[-1]["id"]])[0]["output"]
+    assert "STOPPED at step 2/3" in out
+
+
+@patch("llm_communicator.llm_bash.load_config", return_value=("ollama/qwen3:4b-instruct", None, False))
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_plan_declined_runs_nothing(mock_exec, mock_llm, mock_cfg, monkeypatch):
+    monkeypatch.setenv("DOIT_PPID", "fbplan3")
+    mock_llm.side_effect = [MockResponse(MockMessage(content=_FALLBACK_PLAN_JSON))]
+    agent = BashToolAgent()
+    with patch("builtins.input", return_value="n"):
+        agent.run_single("set up a python project")
+    mock_exec.assert_not_called()

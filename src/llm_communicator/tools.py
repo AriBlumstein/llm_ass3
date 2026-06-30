@@ -144,10 +144,16 @@ def _resolve_bash() -> str:
     raise FileNotFoundError("Could not locate a 'bash' executable.")
 
 
-def execute_bash(command: str, verbose: bool = True) -> str:
+def execute_bash(command: str, verbose: bool = True, cwd: Optional[str] = None,
+                 prelude: Optional[List[str]] = None) -> str:
     """
     Executes a raw bash string in an isolated subprocess under strict constraints.
     Returns stdout/stderr merged result as a single string.
+
+    `cwd` runs the command in that directory (used by the command-plan runner to thread a `cd` across
+    steps). `prelude` is a list of already-screened session-state commands (e.g. `export K=V`) run
+    BEFORE the command in the same shell, so a plan's earlier `export`/`alias` steps apply to a later
+    step. Both default to the normal behavior (current dir, no prelude).
     """
     for pattern in BANNED_COMMAND_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
@@ -163,12 +169,16 @@ def execute_bash(command: str, verbose: bool = True) -> str:
     except FileNotFoundError as exc:
         return f"[Error: {exc}]"
 
+    # Prepend any accumulated session-state (export/alias/...) so it applies to this command.
+    run_command = ("\n".join(list(prelude) + [command])) if prelude else command
+
     try:
         result = subprocess.run(
-            [bash_executable, "-c", command],
+            [bash_executable, "-c", run_command],
             capture_output=True,
             text=True,
-            timeout=20.0
+            timeout=20.0,
+            cwd=cwd,
         )
 
         if not verbose:
@@ -390,6 +400,34 @@ def resolve_cd_hoist(command: str) -> Optional[str]:
         expanded = os.path.join(os.getcwd(), expanded)
     expanded = os.path.normpath(expanded)
     return expanded if os.path.isdir(expanded) else None
+
+
+def resolve_cd_target(command: str, base_cwd: str) -> Optional[str]:
+    """
+    Pure path resolution for a STANDALONE `cd`, used by the command-plan runner to track the working
+    directory across steps. Like `resolve_cd_hoist` but (a) resolves relative paths against `base_cwd`
+    (the plan's running cwd, not `os.getcwd()`) and (b) does NO existence check - the caller validates
+    with `os.path.isdir` when the step runs (a plan may `cd` into a dir an earlier step just created).
+    Returns the absolute normalized target, or None for a compound/`cd -`/non-`cd` command (which the
+    runner then executes normally in a subprocess).
+    """
+    if not command:
+        return None
+    cmd = command.strip()
+    if any(tok in cmd for tok in (";", "&&", "||", "|", "\n", "`", "$(", ">", "<", "&")):
+        return None
+    m = re.match(r"^cd(?:\s+(.*))?$", cmd)
+    if not m:
+        return None
+    target = (m.group(1) or "~").strip()
+    if len(target) >= 2 and target[0] == target[-1] and target[0] in ("'", '"'):
+        target = target[1:-1]
+    if not target or target == "-":
+        return None
+    expanded = os.path.expanduser(os.path.expandvars(target))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(base_cwd, expanded)
+    return os.path.normpath(expanded)
 
 
 # Shell builtins that mutate session state and so cannot work from a subprocess. `cd` is handled
@@ -796,13 +834,55 @@ ANSWER_TOOL_DEF: Dict[str, Any] = {
     "function": {
         "name": "answer_question",
         "description": (
-            "Use this ONLY to ANSWER an informational or how-to question about the shell "
-            "(e.g. 'how do I find files over 100MB?', 'what does chmod do?') WITHOUT executing "
-            "anything. Provide an 'explanation' and, when a command applies, a 'suggested_command' "
-            "the user COULD run. This tool NEVER executes the command - it only explains and "
-            "suggests. To actually run a command, use execute_bash_command instead."
+            "Use this ONLY to ANSWER a QUESTION the user ASKS about the shell - phrased as a question "
+            "seeking knowledge (e.g. 'how do I find files over 100MB?', 'what does chmod do?') - WITHOUT "
+            "executing anything. Provide an 'explanation' and, when a command applies, a 'suggested_command' "
+            "the user COULD run. This tool NEVER executes the command - it only explains and suggests. "
+            "DO NOT use this for an IMPERATIVE instruction to PERFORM an action ('create a file', 'go to X "
+            "then make a venv then create main.py'): that is a task to DO, not a question to answer - use "
+            "execute_bash_command for a single action, or execute_plan for several actions in sequence."
         ),
         "parameters": AnswerInput.model_json_schema()
+    }
+}
+
+PLAN_TOOL_DEF: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "execute_plan",
+        "description": (
+            "Use this for an IMPERATIVE task that genuinely needs SEVERAL shell commands run IN SEQUENCE "
+            "(e.g. scaffolding a project: make a directory, create files, init git). A request that lists "
+            "actions to PERFORM joined by 'then' / 'and then' / 'first ... then ...' (e.g. 'go to my "
+            "projects dir, then create a venv, then create main.py') is exactly this - it is a task to "
+            "EXECUTE here, NOT a question to answer, so do NOT call answer_question for it. Provide an "
+            "ordered list of 'steps', each a single 'command' plus a short 'explanation', and an optional "
+            "one-line 'overview'. The full plan is shown to the user BEFORE anything runs; steps then run "
+            "in order and STOP if one fails (so a broken step doesn't cascade). Use execute_bash_command "
+            "instead for a SINGLE command (even a piped one-liner)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "overview": {
+                    "type": "string",
+                    "description": "Optional one-line summary of the overall goal of the plan."
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "The ordered steps to run, one command each.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "A single bash command for this step."},
+                            "explanation": {"type": "string", "description": "A short explanation of what this step does."}
+                        },
+                        "required": ["command", "explanation"]
+                    }
+                }
+            },
+            "required": ["steps"]
+        }
     }
 }
 

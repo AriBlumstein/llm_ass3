@@ -11,9 +11,11 @@ FALLBACK_SYSTEM_INSTRUCTION = """IMPORTANT: You do not support native tool calli
 - "command": (string) the single-line or multi-line bash script to execute (only when executable is true, otherwise empty "").
 - "suggested_command": (string) for a how-to / informational answer (Rule 9), the bash command the user COULD run - this is SUGGESTED ONLY and is NOT executed. Empty "" for every other rule.
 - "explanation": (string) a short explanation of what the command does, or why it is not executable.
-- "rule_triggered": (integer) the number of the system instruction rule triggered (1 for command generation, 2 for impossible, 3 for safety violation, 4 for irrelevant input, 5 for capability inquiry, 6 for assume file existence, 8 for clarification request, 9 for answering a how-to/informational question).
+- "rule_triggered": (integer) the number of the system instruction rule triggered (1 for command generation, 2 for impossible, 3 for safety violation, 4 for irrelevant input, 5 for capability inquiry, 6 for assume file existence, 8 for clarification request, 9 for answering a how-to/informational question, 13 for a multi-step plan).
 - "response_text": (string) the conversational text, warning, or error message to display directly to the user (required when executable is false, e.g., "bash: command not found" for rule 2, or "The command is not safe to execute. <reason>" for rule 3, or the how-to answer for rule 9).
 - "needs_clarification": (boolean) set to true ONLY when the request is genuinely ambiguous and you need to ask the user before generating a command (Rule 8). When true, also set "executable": false, "command": "", "rule_triggered": 8. You do NOT need to write the question - a separate step authors it.
+- "steps": (array, optional) ONLY for a MULTI-STEP PLAN (Rule 13): when the USER asks for SEVERAL distinct actions in sequence, provide an ordered list of {"command": <one bash command>, "explanation": <short>} objects INSTEAD of a single "command". A request that lists actions to PERFORM joined by "then" / "and then" / "first ... then ..." (e.g. "go to my projects dir, then create a venv, then create main.py") is exactly this case: emit one step per action. Do NOT collapse such a sequence into a single chained "command" with "&&"/";" - use "steps" so each action is shown and runs with stop-on-failure. Also set "rule_triggered": 13 and an optional "overview" (one-line summary). The user is shown the whole plan and confirms once; the steps run in order and stop if one fails. Use "steps" ONLY for a user-requested action sequence - NOT to chain/pipe commands to answer a question (that stays a single "command", pipes included). Omit "steps" entirely otherwise.
+- "overview": (string, optional) a one-line summary of a "steps" plan.
 
 Do not include any other conversational text, pleasantries, markdown formatting (outside of the JSON block itself), or preamble.
 
@@ -101,6 +103,20 @@ Example response when the user asks to RUN a command that a PREVIOUS answer turn
   "rule_triggered": 1,
   "response_text": ""
 }
+
+Example response for a MULTI-STEP PLAN (Rule 13) - the user asked for SEVERAL distinct actions ("create a folder, add a main.py, and init git"). Use "steps" (ordered, one command each) instead of "command":
+{
+  "executable": true,
+  "rule_triggered": 13,
+  "overview": "scaffold a python project",
+  "steps": [
+    {"command": "mkdir myproj", "explanation": "create the project folder"},
+    {"command": "touch myproj/main.py", "explanation": "add an entry file"},
+    {"command": "git -C myproj init", "explanation": "initialize a git repo"}
+  ],
+  "command": "",
+  "response_text": ""
+}
 """
 
 
@@ -119,6 +135,25 @@ FEWSHOT_TOOLCALL = [
     {"role": "assistant", "tool_calls": [{"id": "fs_exec_1", "type": "function",
         "function": {"name": "execute_bash_command", "arguments": '{"command": "touch notes.txt", "explanation": "create an empty file notes.txt"}'}}]},
     {"role": "tool", "tool_call_id": "fs_exec_1", "name": "execute_bash_command", "content": "[Success]"},
+    # USER asked for SEVERAL distinct actions -> call execute_plan (one command per step). The plan is
+    # shown before running and stops on the first failure. (Rule 13.)
+    {"role": "user", "content": "set up a python project: create a folder, add a main.py, and initialize git"},
+    {"role": "assistant", "tool_calls": [{"id": "fs_plan_1", "type": "function",
+        "function": {"name": "execute_plan", "arguments": '{"overview": "scaffold a python project", "steps": [{"command": "mkdir myproj", "explanation": "create the project folder"}, {"command": "touch myproj/main.py", "explanation": "add an entry file"}, {"command": "git -C myproj init", "explanation": "initialize a git repo"}]}'}}]},
+    {"role": "tool", "tool_call_id": "fs_plan_1", "name": "execute_plan", "content": "[Plan complete: all 3 steps succeeded.]"},
+    # An IMPERATIVE "do X, then Y, then Z" sequence -> execute_plan (NOT answer_question). The user is
+    # telling doit to PERFORM these actions, not asking a how-to question, so build and run the plan
+    # rather than just describing/suggesting it. (Rule 13 vs Rule 9.)
+    {"role": "user", "content": "let us go to my projects dir, then create a python virtual environment, then create a file called main.py"},
+    {"role": "assistant", "tool_calls": [{"id": "fs_plan_2", "type": "function",
+        "function": {"name": "execute_plan", "arguments": '{"overview": "set up a project in ~/projects", "steps": [{"command": "cd ~/projects", "explanation": "go to the projects directory"}, {"command": "python -m venv venv", "explanation": "create a python virtual environment"}, {"command": "touch main.py", "explanation": "create an empty main.py"}]}'}}]},
+    {"role": "tool", "tool_call_id": "fs_plan_2", "name": "execute_plan", "content": "[Plan complete: all 3 steps succeeded.]"},
+    # A QUESTION about existing files -> a SINGLE execute_bash_command, even though it pipes. Chaining
+    # to ANSWER a question is NOT a multi-step plan (Rule 13 exclusion; this is Rule 7/11 territory).
+    {"role": "user", "content": "which of these files is the biggest?"},
+    {"role": "assistant", "tool_calls": [{"id": "fs_pipe_1", "type": "function",
+        "function": {"name": "execute_bash_command", "arguments": '{"command": "ls -laS | head -n 5", "explanation": "list files by size, largest first, to answer which is biggest"}'}}]},
+    {"role": "tool", "tool_call_id": "fs_pipe_1", "name": "execute_bash_command", "content": "[Success]"},
     # Ambiguous (which date?) -> call ask_user_clarification (no command).
     {"role": "user", "content": "list the files sorted by date"},
     {"role": "assistant", "tool_calls": [{"id": "fs_clar_2", "type": "function",
@@ -155,6 +190,14 @@ FEWSHOT_FALLBACK = [
     # Rule 1: a DIRECT "find/list ..." request is a command to execute (NOT a how-to, NOT ambiguous).
     {"role": "user", "content": "find files bigger than 100MB in this folder"},
     {"role": "assistant", "content": '{"executable": true, "command": "find . -type f -size +100M", "explanation": "find large files under the current folder", "rule_triggered": 1, "response_text": ""}'},
+    # Rule 13: the USER asked for SEVERAL distinct actions -> emit a `steps` plan (one command per
+    # step), NOT a single chained command. Shown to the user and run in order, stopping on failure.
+    {"role": "user", "content": "set up a python project: create a folder, add a main.py, and initialize git"},
+    {"role": "assistant", "content": '{"executable": true, "rule_triggered": 13, "overview": "scaffold a python project", "steps": [{"command": "mkdir myproj", "explanation": "create the project folder"}, {"command": "touch myproj/main.py", "explanation": "add an entry file"}, {"command": "git -C myproj init", "explanation": "initialize a git repo"}], "command": "", "response_text": ""}'},
+    # Rule 13 (the "then"-sequence case that mis-fired): an IMPERATIVE "do X, then Y, then Z" request
+    # is a `steps` plan, NOT a single "cd ... && ... && ..." chained command. One step per action.
+    {"role": "user", "content": "let us go to my projects dir, then create a python virtual environment, then create a file called main.py"},
+    {"role": "assistant", "content": '{"executable": true, "rule_triggered": 13, "overview": "set up a project in ~/projects", "steps": [{"command": "cd ~/projects", "explanation": "go to the projects directory"}, {"command": "python -m venv venv", "explanation": "create a python virtual environment"}, {"command": "touch main.py", "explanation": "create an empty main.py"}], "command": "", "response_text": ""}'},
     # Rule 8: clarify ONLY for a genuinely ambiguous sort/select KEY ("by date"). Note: this is
     # an imperative WITHOUT "how" - a how-to question is never answered with clarification.
     {"role": "user", "content": "sort my downloads by date"},

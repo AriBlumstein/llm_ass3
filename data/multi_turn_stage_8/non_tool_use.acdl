@@ -1,0 +1,215 @@
+// Doit Agent Context: Non-Tool Use / Fallback JSON Scenario (Multi-Turn Stage 8 - command plans)
+//
+// Entry point: BashToolAgent.run_single (tool_calling = false). The model emits a raw fallback-JSON
+// block; execution output and clarification answers are fed back as USER messages.
+//
+// Stage 8 carries over everything from Stage 7 (multi-window) and adds MULTI-STEP COMMAND PLANS to
+// fallback mode too. There is no `execute_plan` tool here, so the plan rides on the FALLBACK JSON: an
+// optional `steps` array (one (command, explanation per step) with optional `overview` and
+// `rule_triggered: 13`, emitted INSTEAD of a single `command`. It adds NO new LLM context - the plan is
+// produced in the SAME generation call (the DoitNonToolUseAgent's JSON) and then executed
+// DETERMINISTICALLY by `_run_plan` (the same runner the tool path uses), with no model in the loop.
+//
+// So every fallback LLM context is EXACTLY as in Stage 7 - ExplainCommand, HowtoAnswerSubcall,
+// CrossSessionResolver, HistoryReferenceResolver, DoitNonToolUseAgent, ClarificationAuthor, BashFilter,
+// MemoryManager. The only change is inside DoitNonToolUseAgent: its JSON contract gains the optional
+// `steps` array, and a `steps` result routes to ExecutePlan (below) instead of BashFilter.
+//
+// Rule 13 in `sys.doit_system_prompt` + `sys.fallback_system_instruction` direct the model: when the
+// USER asks for SEVERAL distinct actions, emit `steps`; for a single command - including a pipe/`&&`
+// chain built to ANSWER A QUESTION - keep using `command` (Rule 7/11). A `sys.fewshot_fallback`
+// example demonstrates the `steps` plan.
+//
+// DETERMINISTIC Python checks run BEFORE the main pipeline and can short-circuit (in order):
+//   - activity query (is_activity_query): "what did I/you just do" -> answer from history (no LLM);
+//                                         "explain ..." -> ExplainCommand; cross-window phrasing ->
+//                                         CrossSessionActivityReport (no LLM). Then DONE.
+//   - session list (is_session_list_query): "list the shell numbers" -> report list_sessions. Then DONE.
+//   - how-to question (is_howto_question) AND NOT a cross-session reference -> HowtoAnswerSubcall, then DONE.
+//   - "execute that" (is_execute_suggestion_request) AND a prior suggested_command exists
+//                                                      -> run that command through BashFilter, then DONE.
+// Otherwise the pipeline runs:
+//   1) CrossSessionResolver      - ONLY on an explicit cross-window reference: picks the other session (unchanged)
+//   1') HistoryReferenceResolver - same-session resolver; SKIPPED when a cross-session ref fired     (unchanged)
+//   2) DoitNonToolUseAgent       - generates/answers; JSON contract gains an optional `steps` array   (CHANGED)
+//   3) ClarificationAuthor       - authors the clarifying question; ALSO picks a window (session menu) (unchanged)
+//   4) BashFilter                - judges filesystem modification for a SINGLE command                (unchanged)
+//   5) MemoryManager             - stores/updates/deletes durable memories after the turn            (unchanged)
+//
+// Notation: @T is the current turn; a step i WITHIN turn @T is written @T.i. Convention: index < @T = prior turn.
+
+
+// 0a. ExplainCommand (explain_command) - unchanged from Stage 7.
+ExplainCommand[@T]: {
+    S: {
+        sys.explain_command_prompt
+    }
+
+    U: sys.pid.most_recent_command[@T]
+}
+
+
+// 0a'. CrossSessionActivityReport (_answer_cross_session_activity) - unchanged from Stage 7, no LLM.
+//      A cross-window activity query resolves the target session and REPORTS its recent command-bearing
+//      turns straight from its doit.jsonl. Deterministic. Then DONE.
+
+// 0b. HowtoAnswerSubcall (answer_howto_question) - unchanged from Stage 7. Guarded by
+//     `not is_cross_session_reference`, so a cross-session phrasing reaches the pipeline below.
+HowtoAnswerSubcall[@T]: {
+    S: {
+        sys.answer_howto_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 1. CrossSessionResolver (resolve_cross_session) - unchanged from Stage 7.
+//    Fires ONLY when is_cross_session_reference matched, >=1 other session exists, and it is not an
+//    exact pid. Picks the other window and its relevant turns; not-confident -> session menu (step 3).
+CrossSessionResolver[@T]: {
+    S: {
+        sys.cross_session_resolver_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.other_sessions_summary[@T]          // numbered: each other session's pid, cwd, last-active, recent commands (with ids)
+    }
+}
+
+
+// 1'. HistoryReferenceResolver (_analyze_references) - unchanged from Stage 7.
+//     SAME-session resolver; SKIPPED when a cross-session reference fired.
+HistoryReferenceResolver[@T]: {
+    S: {
+        sys.history_system_instruction          // states the attribution defaults
+    }
+
+    U: {
+        env.user_input[@T]
+        sys.pid.history_metadata_reversed[@T]
+    }
+}
+
+
+// 2. DoitNonToolUseAgent - CHANGED vs Stage 7.
+//    The fallback-JSON contract gains an optional `steps` array (Rule 13). The system prompt's Rule 13
+//    and a `sys.fewshot_fallback` plan example teach the model to emit `steps` when the USER asked for
+//    several distinct actions. Context assembly (memory, activity, cross-session vs same-session replay,
+//    clarification rounds) is IDENTICAL to Stage 7. A prior PLAN turn replays as a single serialized
+//    command-JSON whose `command` is the step commands joined with "; ".
+DoitNonToolUseAgent[@T]: {
+    S: {
+        sys.doit_system_prompt                  // carries Rule 12 (multi-window, Stage 7) and Rule 13 (multi-step plans, Stage 8)
+        sys.fallback_system_instruction         // now ALSO documents the optional `steps` array + rule_triggered:13
+        If(sys.has_memories[@T]) {
+            sys.memory_block[@T]
+        }
+        sys.activity_block[@T]
+    }
+
+    ForEach(@d: sys.fewshot_fallback) {         // now ALSO includes a `steps` plan demonstration (Rule 13)
+        U: sys.fewshot_fallback[@d].instruction
+        A: sys.fewshot_fallback[@d].response
+    }
+
+    If(resp.pid.cross_session_resolver[@T].matched) {
+        // Cross-session: the chosen other session's relevant turns, tagged, folded into user_content.
+        ForEach(@x: resp.pid.cross_session_resolver[@T].relevant_ids) {
+            U: cross_session_note(sys.other.turn[@x])   // "[from your other terminal session (pid ...) in <cwd>]: ..."
+        }
+    } Else {
+        // Same-session replay (Stage 6/7 behavior), folded into user_content to keep alternation.
+        // OUTPUT-AWARENESS SAFETY NET: for a follow-up the replayed ids ALSO include
+        // get_latest_output_turn_id() (most recent doit turn with real output).
+        ForEach(@t: resp.pid.history_reference_resolver[@T].relevant_ids + sys.pid.latest_output_turn[@T]) {
+            If(sys.pid.turn[@t].source == "user") {
+                U: user_ran_note(sys.pid.turn[@t].command, sys.pid.turn[@t].output)
+            } Else {
+                U: sys.pid.turn[@t].prompt
+                If(sys.pid.turn[@t].command != "") {     // a prior PLAN replays here too: command = steps joined "; "
+                    A: sys.pid.tool_call[@t]            // SERIALIZED fallback-JSON: executable=true, command, rule_triggered=1
+                    T: sys.pid.turn[@t].output          // SERIALIZED USER message "Command execution output: <output>"
+                } Else {
+                    If(sys.pid.turn[@t].suggested_command != "") {
+                        A: sys.pid.answer_replay[@t]    // SERIALIZED fallback-JSON: executable=false, suggested_command, rule_triggered=9
+                    } Else {
+                        A: sys.pid.turn[@t].output
+                    }
+                }
+            }
+        }
+    }
+
+    U: env.user_input[@T]
+
+    ForEach(i: pid.clarification_steps[@T]) {
+        If(resp.pid.doit_non_tool_use_agent[@T.i].needs_clarification) {
+            A: resp.pid.doit_non_tool_use_agent[@T.i]
+            T: env.user_clarification_answer[@T.i]
+        }
+    }
+    // Terminal fallback-JSON (model-elected) is ONE of:
+    //   - (executable:true, command, rule_triggered:1)                      -> single command (-> BashFilter, then run/hoist)
+    //   - (executable:true, steps:[(command, explanation)], rule:13, overview?)   -> a multi-step plan (-> ExecutePlan)   NEW
+    //   - (executable:false, suggested_command, rule:9)                          -> how-to answer (suggest, not run)
+    //   - (needs_clarification:true, rule:8)                                     -> ask a clarifying question
+    //   - (executable:false, response_text, rule:2/3/4/5)                        -> rejection / conversational reply
+    // A cross-session task is re-grounded in the CURRENT cwd (Rule 12).
+}
+
+
+// 2'. Plan execution (_run_plan) - NEW in Stage 8 (fallback). DETERMINISTIC, NO LLM, so it is NOT an
+//     ACDL context (no messages array, no model call) - described here in prose only. When the parsed
+//     fallback JSON carries a non-empty `steps` array, run_single's fallback branch routes it to the
+//     SAME `_run_plan` the tool path uses (so behavior is identical across modes): (1) SHOW the whole
+//     plan (overview + numbered command/explanation list); (2) ask ONE "Run this N-step plan? [y/N]" -
+//     declined -> nothing runs (this plan-level consent replaces the per-command BashFilter LLM judge:
+//     a plan does NOT pass through BashFilter); (3) run the steps IN ORDER, each via execute_bash (regex
+//     blacklist applies); (4) STOP at the first failed step, skipping the rest. A standalone `cd` is
+//     tracked (validated via os.path.isdir, not subprocessed) and session-state builtins accumulate as a
+//     prelude for later steps; on success the net cwd/shell-state are hoisted to the parent shell
+//     (_hoist_cd/_hoist_shell). The transcript is fed back as a USER message ("Plan execution output:
+//     ...") and stored as the turn's output, with executed_command = the step commands joined with "; ".
+
+
+// 3. ClarificationAuthor (_author_clarification) - unchanged from Stage 7.
+//    Authors a clarifying question for an ambiguous instruction; ALSO reused (with a prebuilt session
+//    menu, no LLM authoring) to let the user pick which window when CrossSessionResolver is unsure.
+ClarificationAuthor[@T.i]: {
+    S: {
+        sys.clarify_author_prompt
+    }
+
+    U: env.user_input[@T]
+}
+
+
+// 4. BashFilter (_filter_bash) - unchanged from Stage 7. Vets the SINGLE-command path. NOTE: a `steps`
+//    plan does NOT pass through BashFilter - it is gated by its own plan-level [y/N] (see ExecutePlan).
+BashFilter[@T]: {
+    S: {
+        sys.doit_filter_prompt
+    }
+
+    U: {
+        sys.filter_user_instruction
+        resp.pid.doit_non_tool_use_agent[@T].command
+    }
+}
+
+
+// 5. MemoryManager (extract_memories) - unchanged from Stage 7. For a plan, the executed command is the
+//    step commands joined with "; ".
+MemoryManager[@T]: {
+    S: {
+        sys.memory_manager_prompt
+    }
+
+    U: {
+        env.user_input[@T]
+        resp.pid.doit_non_tool_use_agent[@T].command
+        sys.memories[@T]
+    }
+}
