@@ -910,4 +910,3 @@ CLARIFY_TOOL_DEF: Dict[str, Any] = {
     }
 }
 
-tools_definition: List[Dict[str, Any]] = [EXECUTE_TOOL_DEF, CLARIFY_TOOL_DEF]

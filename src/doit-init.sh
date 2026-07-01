@@ -53,6 +53,11 @@ __doit_preexec() {                                  # DEBUG trap: $BASH_COMMAND 
 __doit_record() {                                   # prompt hook: pair the captured command with $?
     local _ec=$?
     if [ -n "${DOIT_CMD_LOG:-}" ] && [ -n "${__doit_pending:-}" ]; then
+        # `doit --reset` wipes this session's folder out from under us; the very next prompt would
+        # then try to append to a now-deleted cmdlog, and the failed `>>` leaks a "No such file or
+        # directory" error (it's reported during redirection setup, before 2>/dev/null applies).
+        # Heal the folder if it's gone so recording resumes silently instead of erroring.
+        [ -d "${DOIT_CMD_LOG%/*}" ] || mkdir -p "${DOIT_CMD_LOG%/*}" 2>/dev/null
         printf '%s\t%s\n' "$_ec" "$__doit_pending" >> "$DOIT_CMD_LOG" 2>/dev/null
     fi
     __doit_pending=""
