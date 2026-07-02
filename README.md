@@ -27,6 +27,29 @@ bash src/doit "list all files in the current directory"
 
 An instruction is required; running `doit` with no argument prints a usage error.
 
+## Configuration (`doit.cfg`)
+
+`doit.cfg` at the project root is the runtime switch for which LLM backend `doit` talks to. It is
+read on every invocation by `config_loader.load_config()`, so changing it takes effect on the next
+run — no reinstall. It has a single `[model]` section:
+
+```ini
+[model]
+name = ollama/qwen3:4b-instruct
+tool_calling = True
+```
+
+| Key | Required | Description |
+| --- | --- | --- |
+| `name` | yes | The LiteLLM model id to use. Prefix selects the provider: `openai/...` (e.g. `openai/gpt-5.4-nano`) for OpenAI, `ollama/...` (e.g. `ollama/qwen3:4b-instruct`, `ollama/gemma3:4b`) for a local Ollama model. |
+| `tool_calling` | yes | `True` or `False`. **The single most important flag** — it selects between two entirely different prompt/parsing code paths. `True` uses the model's **native function calling** (commands come back as real tool calls). `False` uses **fallback mode**: the model is instead forced to emit a raw JSON block that `doit` parses. Set `False` for local models that lack reliable native tool calling (e.g. `gemma3:4b`, where `True` does nothing). |
+| `api_base` | no | Custom endpoint URL. Mainly for Ollama (e.g. `http://localhost:11434`). Omit for OpenAI. |
+
+If the file is missing or a key is absent, `doit` falls back to sensible defaults
+(`name` = `gpt-5.4-nano`, `tool_calling` = `True`, `api_base` = none); a malformed file prints a
+warning and uses those defaults. Note that OpenAI models also need `OPENAI_API_KEY` in `.env` (see
+[Setup](#setup)).
+
 ## Shell integration (persistent `cd`/`export` + user awareness)
 
 A program on your PATH runs as a child process and cannot change your shell's
@@ -43,15 +66,18 @@ With it sourced, `doit` becomes a shell function that wraps the launcher and giv
 - **Persistent `cd` / `export` / `alias` …** — when the agent generates a
   shell-state command (e.g. "go to my project"), the function applies it in *your*
   shell, so the change persists.
-- **User awareness (with success/failure)** — sourcing the file also installs a small
-  per-command hook (bash `DEBUG` trap + `PROMPT_COMMAND`; zsh `preexec`/`precmd`) that
-  logs each command you run **and its exit status** to this session's `cmdlog.tsv`
-  (exposed as `DOIT_CMD_LOG`). `doit` reads it and records your manual commands as `user`
-  turns — with real `exit 0` / `FAILED` markers — alongside its own `doit` turns in one
-  ordered, per-session history. So it can answer `doit "summarize what I just did"`, ground
-  new commands in your current directory, tell what came last (e.g. if you manually undo
-  something it did), and know whether a command you ran succeeded or failed. (If the hook
-  isn't active, it falls back to `fc -l`, which has the commands but no exit status.)
+- **User awareness (with success/failure + directory)** — sourcing the file also installs a
+  small per-command hook (bash `DEBUG` trap + `PROMPT_COMMAND`; zsh `preexec`/`precmd`) that
+  logs each command you run, **its exit status, and the directory it ran in** to this session's
+  `cmdlog.tsv` (exposed as `DOIT_CMD_LOG`). `doit` reads it and records your manual commands as
+  `user` turns — with real `exit 0` / `FAILED` markers and the recorded directory — alongside its
+  own `doit` turns in one ordered, per-session history. So it can answer
+  `doit "summarize what I just did"`, ground new commands in your current directory, tell what came
+  last (e.g. if you manually undo something it did), know whether a command you ran succeeded or
+  failed, and **re-run a past command in the place it actually ran** — if you ask about a command
+  you ran in another directory (e.g. `doit "how many files were in that ls I ran?"`), doit targets
+  that directory (`cd <dir> && …`) instead of your current one. (If the hook isn't active, it falls
+  back to `fc -l`, which has the commands but no exit status or directory.)
 
 Everything for one shell session lives together in a single gitignored folder,
 `<repo>/.doit/history_<pid>/`, holding `cmdlog.tsv` (your commands + exit codes) and
@@ -71,12 +97,13 @@ The only out-of-program change is the one `source …/doit-init.sh` line in your
 `~/.bashrc`/`~/.zshrc`. That loads `src/doit-init.sh`, which (a) defines the `doit`
 shell function and (b) installs a per-command recorder hook. The function does what a
 child process can't — apply directory/shell-state changes in the current shell. The
-recorder hook captures each command + its exit status (a child process can't see your
-shell's command history or results) and appends them to the gitignored
-`<repo>/.doit/history_<pid>/cmdlog.tsv`. Nothing is written to your own shell history file.
+recorder hook captures each command + its exit status + the directory it ran in (a child
+process can't see your shell's command history or results) and appends them to the gitignored
+`<repo>/.doit/history_<pid>/cmdlog.tsv` (tab-separated: `status`, `directory`, `command`).
+Nothing is written to your own shell history file.
 
 **Notes & privacy:** your recent shell commands are sent to the configured LLM as
-context (only commands and their exit status, **not** their output). Without the function
+context (only commands, their exit status, and the directory they ran in, **not** their output). Without the function
 (e.g. running `./src/doit` directly), doit still works — it just loses persistence and user
 awareness and falls back gracefully. Remove the integration anytime by deleting
 the `source` line from your shell rc.
@@ -100,6 +127,13 @@ doit "why did that command fail?"
   succeeded and are safe to repeat (read-only ones like `ls`/`cat`/`grep`); it won't blindly
   re-run something that changed your files. Re-runs still pass the usual safety check.
 
+**Why did it fail?** When you ask why a command failed, doit explains the *cause*, not just that it
+failed — it **reads the exit code** and interprets it (e.g. `127` = command not found, `126` =
+permission denied / not executable, `2` = syntax error, `139` = segfault, `137` = killed/OOM). For
+its own commands it combines that with the captured error output (STDERR); for commands you ran (no
+output stored) the exit code is the main signal, and it can safely re-run a read-only command to
+reproduce the error.
+
 Attribution follows what you say: "what did **you/we** just do" refers to doit's last
 action, "the command **I** just did" to your last command, and an unqualified "that" / "the
 previous command" to whichever ran most recently.
@@ -113,7 +147,7 @@ in one window only ever refers to *that* window's commands — never another's.
 When you *do* want to reach across windows, reference another one explicitly:
 
 ```bash
-doit "list the shell numbers"          # see your open windows: pid — directory — last active
+doit "list the session numbers"          # see your open windows: pid — directory — last active
 doit "do the folder task we did in the other window here"
 doit "redo what I ran in session 12345 here"
 ```
@@ -166,3 +200,26 @@ the tool via the `DOIT_BASH` environment variable. You can override it manually:
 ```bash
 DOIT_BASH="/path/to/bash" ./src/doit "..."
 ```
+
+## ACDL documentation
+
+The agent's prompt/context structure is documented in **ACDL** (Agentic Context Description
+Language). There are two places these docs live, and they are **not** duplicates — each holds
+something the other does not:
+
+- **`data/acdl/`** — the actual ACDL **source text**. This is the authoritative version. Files are
+  organized by execution flow: `single_turn/` for the single-instruction path and
+  `multi_turn_stage_1/` … `multi_turn_stage_8/` for the multi-turn stages, each with a
+  `tool_use.acdl` (native tool-calling path) and a `non_tool_use.acdl` (fallback JSON path).
+
+  **Folder → phase mapping.** The folder names are offset by one from the phase numbers used in the
+  report: `single_turn/` maps to **phase 1**, and each `multi_turn_stage_#` maps to **phase #+1**
+  (so `multi_turn_stage_1/` = phase 2, `multi_turn_stage_2/` = phase 3, …, `multi_turn_stage_8/` =
+  phase 9).
+- **The report** — the **generated pictures** rendered from that ACDL source. Use these for a
+  quick visual read of the context/flow.
+
+Important: the `.acdl` source files in `data/acdl/` contain **inline comments that are not present
+in the report pictures**. Those comments explain additional design decisions behind the
+prompt/context structure, so read the ACDL text in `data/acdl/` (not just the report images) when
+you want the full rationale.
