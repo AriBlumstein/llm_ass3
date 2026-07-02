@@ -27,6 +27,7 @@ from llm_communicator.tools import (
     extract_memories,
     parse_shell_history,
     parse_cmd_log,
+    explain_exit_code,
     is_doit_invocation,
     is_activity_query,
     explain_command,
@@ -331,9 +332,10 @@ class BashToolAgent:
     @staticmethod
     def _read_user_commands() -> List[tuple]:
         """
-        The user's recent terminal commands as [(index, status, command)]. Prefers the exit-status log
-        (DOIT_CMD_LOG, written by the shell recorder - status is "0"/"N"); falls back to `fc -l` history
-        (DOIT_SHELL_HISTORY, status None). Empty when there is no shell integration.
+        The user's recent terminal commands as [(index, status, cwd, command)]. Prefers the exit-status
+        log (DOIT_CMD_LOG, written by the shell recorder - status is "0"/"N", cwd is the dir the command
+        ran in); falls back to `fc -l` history (DOIT_SHELL_HISTORY, status and cwd None). Empty when
+        there is no shell integration.
         """
         log = os.environ.get("DOIT_CMD_LOG")
         if log:
@@ -346,7 +348,7 @@ class BashToolAgent:
                 pass
         raw = os.environ.get("DOIT_SHELL_HISTORY")
         if raw:
-            return [(n, None, cmd) for n, cmd in parse_shell_history(raw)]
+            return [(n, None, None, cmd) for n, cmd in parse_shell_history(raw)]
         return []
 
     @staticmethod
@@ -358,7 +360,11 @@ class BashToolAgent:
         s = str(status).strip()
         if s == "0":
             return "[Ran by the user directly in the terminal; completed successfully (exit 0). Output not captured by doit.]"
-        return f"[Ran by the user directly in the terminal; it FAILED (exit {s}). Output not captured by doit.]"
+        # No output was captured for a user command, so the exit code is the only failure signal -
+        # interpret it (e.g. 127 -> command not found) so "why did that fail?" gets a real reason.
+        meaning = explain_exit_code(s)
+        detail = f"exit {s}: {meaning}" if meaning else f"exit {s}"
+        return f"[Ran by the user directly in the terminal; it FAILED ({detail}). Output not captured by doit.]"
 
     def _sync_user_history(self) -> None:
         """
@@ -373,12 +379,12 @@ class BashToolAgent:
             return
         try:
             last_seen = history_manager.get_last_user_hist_n()
-            for idx, status, cmd in entries:
+            for idx, status, cwd, cmd in entries:
                 if idx <= last_seen or is_doit_invocation(cmd):
                     continue
                 history_manager.append_history_turn(
                     prompt="", command=cmd, output=self._user_cmd_output(status),
-                    relevant_ids=[], source="user", hist_n=idx,
+                    relevant_ids=[], source="user", hist_n=idx, cwd=cwd,
                 )
         except Exception as e:
             _debug("USER-HISTORY sync failed:", e)
@@ -453,7 +459,11 @@ class BashToolAgent:
             )
             for t in recent:
                 tag = "user" if t.get("source") == "user" else "doit"
-                lines.append(f"  [{tag}] {t['command']}")
+                # Show WHERE a user command ran when it differs from the current directory, so a
+                # later "re-run that / why did it fail" can target the right place (Rule 11).
+                t_cwd = t.get("cwd")
+                where = f" (in {t_cwd})" if tag == "user" and t_cwd and t_cwd != cwd else ""
+                lines.append(f"  [{tag}] {t['command']}{where}")
         return "\n".join(lines)
 
     def _store_memories(self, instruction: str, executed_command: str = "") -> None:
@@ -955,7 +965,8 @@ class BashToolAgent:
                 # plain note (no doit tool call/result), so the agent treats it as the user's action.
                 # Include the "it ran" marker so the agent doesn't read empty output as a failure.
                 if turn.get("source") == "user":
-                    note = f"[I ran this command directly in the terminal]: {turn.get('command', '')}"
+                    where = f" in {turn['cwd']}" if turn.get("cwd") else ""
+                    note = f"[I ran this command directly in the terminal{where}]: {turn.get('command', '')}"
                     if turn.get("output"):
                         note += f"\n{turn['output']}"
                     self.conversation_history.append({"role": "user", "content": note})
@@ -1047,7 +1058,8 @@ class BashToolAgent:
                 # so it stays right next to the instruction and never breaks user/assistant alternation.
                 # Include the "it ran" marker so empty output isn't read as a failure.
                 if turn.get("source") == "user":
-                    note = f"[I ran this command directly in the terminal]: {turn.get('command', '')}"
+                    where = f" in {turn['cwd']}" if turn.get("cwd") else ""
+                    note = f"[I ran this command directly in the terminal{where}]: {turn.get('command', '')}"
                     if turn.get("output"):
                         note += f"\n{turn['output']}"
                     user_content = (user_content + "\n\n" + note) if user_content else note
@@ -1280,6 +1292,18 @@ class BashToolAgent:
                     print(content)
                     history_manager.append_history_turn(_persist_prompt(instruction, clar_log), "", content, llm_relevant_ids)
                     return
+
+                # Rule 11 (output awareness) must ANSWER BY RUNNING the command, not merely suggest it.
+                # A weak/cautious model sometimes conflates it with a Rule 9 how-to: it returns the
+                # re-run as `suggested_command` with `executable: false` (as seen on "of the files I
+                # listed, which are directories?"). Deterministically promote it to an executed command
+                # so the question actually gets answered; it still passes the modification safety check.
+                if (not executable and not command and suggested_command
+                        and str(rule_triggered) == "11"):
+                    _debug("RULE-11 SALVAGE: promoting suggested_command to an executed re-run")
+                    command = suggested_command
+                    suggested_command = ""
+                    executable = True
 
                 if parsed.get("needs_clarification") and rounds_remaining > 0:
                     # The agent flagged ambiguity. The clarification tool authors the question

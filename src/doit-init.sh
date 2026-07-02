@@ -46,9 +46,11 @@ unset _DOIT_REPO
 # other way - reading history in the prompt hook - mis-pairs, because bash adds a command to history
 # only AFTER PROMPT_COMMAND, so the history lags the status by one.
 __doit_pending=""
+__doit_pending_dir=""
 __doit_preexec() {                                  # DEBUG trap: $BASH_COMMAND = command about to run
     case "$BASH_COMMAND" in *__doit_*) return ;; esac   # ignore our own machinery
     __doit_pending="$BASH_COMMAND"
+    __doit_pending_dir="$PWD"                       # capture the dir the command runs IN (pre-run)
 }
 __doit_record() {                                   # prompt hook: pair the captured command with $?
     local _ec=$?
@@ -58,13 +60,16 @@ __doit_record() {                                   # prompt hook: pair the capt
         # directory" error (it's reported during redirection setup, before 2>/dev/null applies).
         # Heal the folder if it's gone so recording resumes silently instead of erroring.
         [ -d "${DOIT_CMD_LOG%/*}" ] || mkdir -p "${DOIT_CMD_LOG%/*}" 2>/dev/null
-        printf '%s\t%s\n' "$_ec" "$__doit_pending" >> "$DOIT_CMD_LOG" 2>/dev/null
+        # Line format: "<exit status>\t<directory>\t<command>". The directory lets doit re-run a
+        # past user command in the place it actually ran, even from a different cwd later.
+        printf '%s\t%s\t%s\n' "$_ec" "$__doit_pending_dir" "$__doit_pending" >> "$DOIT_CMD_LOG" 2>/dev/null
     fi
     __doit_pending=""
+    __doit_pending_dir=""
 }
 if [ -n "${ZSH_VERSION:-}" ]; then
     # zsh has native preexec (gets the command line as $1) and precmd hooks - cleaner than bash.
-    __doit_zpreexec() { __doit_pending="$1"; }
+    __doit_zpreexec() { __doit_pending="$1"; __doit_pending_dir="$PWD"; }
     autoload -Uz add-zsh-hook 2>/dev/null && {
         add-zsh-hook preexec __doit_zpreexec
         add-zsh-hook precmd  __doit_record

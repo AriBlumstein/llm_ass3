@@ -144,6 +144,35 @@ def _resolve_bash() -> str:
     raise FileNotFoundError("Could not locate a 'bash' executable.")
 
 
+# Human meanings for well-known bash/POSIX exit codes, so doit can explain WHY a command failed
+# (especially user commands, whose output is not captured - the exit code is the only signal).
+_EXIT_CODE_MEANINGS = {
+    1: "general error",
+    2: "misuse of shell builtin or syntax error",
+    124: "timed out",
+    126: "command found but not executable (permission denied)",
+    127: "command not found",
+    128: "invalid exit argument",
+    130: "terminated by Ctrl-C (SIGINT)",
+    137: "killed (SIGKILL - often out of memory)",
+    139: "segmentation fault (SIGSEGV)",
+    143: "terminated (SIGTERM)",
+}
+
+
+def explain_exit_code(code) -> str:
+    """
+    A short human explanation for a well-known bash exit code (e.g. 127 -> 'command not found').
+    Returns "" for success (0), unknown codes, or a non-numeric value, so callers keep their existing
+    text for uncommon codes. Accepts an int or a string.
+    """
+    try:
+        n = int(str(code).strip())
+    except (TypeError, ValueError):
+        return ""
+    return _EXIT_CODE_MEANINGS.get(n, "")
+
+
 def execute_bash(command: str, verbose: bool = True, cwd: Optional[str] = None,
                  prelude: Optional[List[str]] = None) -> str:
     """
@@ -198,7 +227,11 @@ def execute_bash(command: str, verbose: bool = True, cwd: Optional[str] = None,
             # Label the exit status explicitly: 0 means SUCCESS. A bare "0" was being misread by the
             # model as a failure (e.g. refusing to delete a file a prior `touch` actually created).
             status = "SUCCESS" if result.returncode == 0 else "FAILED"
-            output += f"--- RETURN CODE ---\n{result.returncode} ({status})\n"
+            # For a known failure code, spell out the likely cause (e.g. 127 -> command not found) so
+            # "why did that fail?" can be answered from the exit code, not just the raw number.
+            meaning = explain_exit_code(result.returncode) if result.returncode != 0 else ""
+            label = f"{status}: {meaning}" if meaning else status
+            output += f"--- RETURN CODE ---\n{result.returncode} ({label})\n"
 
         # A command that exits 0 with no stdout/stderr still succeeded - say so clearly.
         if result.returncode == 0 and not result.stdout and not result.stderr:
@@ -665,16 +698,27 @@ def parse_shell_history(raw: str) -> List[tuple]:
 
 def parse_cmd_log(raw: str) -> List[tuple]:
     """
-    Parse the per-command exit-status log (each line '<exit status>\\t<command>', written by the
-    doit shell recorder) into [(line_index, status, command), ...]. line_index is the de-dup key.
+    Parse the per-command exit-status log written by the doit shell recorder into
+    [(line_index, status, cwd, command), ...]. line_index is the de-dup key.
+
+    Two line formats are accepted for backward compatibility:
+      - '<exit status>\\t<directory>\\t<command>'  (current: cwd = the dir the command ran in)
+      - '<exit status>\\t<command>'                (legacy: no directory -> cwd is None)
     """
     out = []
     for i, line in enumerate((raw or "").splitlines(), 1):
-        if "\t" in line:
-            status, cmd = line.split("\t", 1)
-            cmd = cmd.strip()
-            if cmd:
-                out.append((i, status.strip(), cmd))
+        if "\t" not in line:
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            status, cwd, cmd = parts
+            cwd = cwd.strip() or None
+        else:                                   # legacy 2-field line: no directory recorded
+            status, cmd = parts
+            cwd = None
+        cmd = cmd.strip()
+        if cmd:
+            out.append((i, status.strip(), cwd, cmd))
     return out
 
 

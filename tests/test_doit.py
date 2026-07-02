@@ -191,8 +191,45 @@ def test_exit_code_zero_is_labelled_success():
 
 
 def test_nonzero_exit_code_is_labelled_failed():
-    output = execute_bash("sh -c 'exit 3'", verbose=True)  # exits 3
+    output = execute_bash("sh -c 'exit 3'", verbose=True)  # exits 3 (unknown code -> bare FAILED)
     assert "3 (FAILED)" in output
+
+
+def test_explain_exit_code():
+    from llm_communicator.tools import explain_exit_code
+    assert explain_exit_code(127) == "command not found"
+    assert explain_exit_code("127") == "command not found"       # string accepted
+    assert "permission denied" in explain_exit_code(126)
+    assert explain_exit_code(1) == "general error"
+    assert explain_exit_code(139) == "segmentation fault (SIGSEGV)"
+    assert explain_exit_code(0) == ""                            # success -> no meaning
+    assert explain_exit_code(3) == ""                            # unknown code -> no meaning
+    assert explain_exit_code(None) == ""                         # non-numeric -> no meaning
+    assert explain_exit_code("oops") == ""
+
+
+def test_execute_bash_explains_command_not_found():
+    # A command-not-found exits 127; the RETURN CODE line should spell out the cause.
+    output = execute_bash("doit_no_such_command_xyz_123", verbose=True)
+    assert "127 (FAILED: command not found)" in output
+
+
+def test_user_cmd_output_interprets_failure_exit_code():
+    # A failed user command with a known code carries the interpreted cause...
+    out127 = BashToolAgent._user_cmd_output("127")
+    assert "FAILED (exit 127: command not found)" in out127
+    # ...an unknown code keeps the bare "exit N" (no colon-meaning)...
+    out3 = BashToolAgent._user_cmd_output("3")
+    assert "FAILED (exit 3)" in out3
+    assert "exit 3:" not in out3
+    # ...and success is unchanged.
+    assert "completed successfully (exit 0)" in BashToolAgent._user_cmd_output("0")
+
+
+def test_rule11_mentions_exit_code_interpretation():
+    from fixtures import DOIT_SYSTEM_PROMPT
+    assert "command not found" in DOIT_SYSTEM_PROMPT
+    assert "READ THE EXIT CODE" in DOIT_SYSTEM_PROMPT
 
 
 # =====================================================================
@@ -395,8 +432,8 @@ def test_history_manager_basic_operations(tmp_path, monkeypatch):
     # Verify metadata (outputs omitted)
     metadata = history_manager.get_history_metadata()
     assert len(metadata) == 2
-    assert metadata[0] == {"id": 1, "source": "doit", "prompt": "list files", "command": "ls", "suggested_command": ""}
-    assert metadata[1] == {"id": 2, "source": "doit", "prompt": "show process", "command": "ps", "suggested_command": ""}
+    assert metadata[0] == {"id": 1, "source": "doit", "cwd": None, "prompt": "list files", "command": "ls", "suggested_command": ""}
+    assert metadata[1] == {"id": 2, "source": "doit", "cwd": None, "prompt": "show process", "command": "ps", "suggested_command": ""}
     
     # Verify full turns retrieval
     full_turns = history_manager.get_full_turns([1])
@@ -696,6 +733,48 @@ def test_json_error_parsing(mock_completion, mock_print, tmp_path, monkeypatch):
     agent.run_single("some prompt")
 
     mock_print.assert_any_call("error from qwen")
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_fallback_rule11_suggested_command_is_promoted_and_run(mock_execute_bash, mock_completion, mock_load_config):
+    """Fallback (non-tool-calling): an output-awareness question is answered by RUNNING a command.
+    When the model demotes the re-run to a suggested_command with executable:false but flags
+    rule_triggered 11, doit promotes it to an executed command (Rule 11 salvage) rather than just
+    printing 'Suggested command (not executed)'."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("openai/gpt-5.4-nano", None, False)
+    history_manager.append_history_turn(
+        "", "ls", BashToolAgent._user_cmd_output("0"), source="user", hist_n=1, cwd="/proj",
+    )
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    # The exact shape observed in the wild: re-run parked in suggested_command, executable false.
+    gen = MockMessage(content=json.dumps({
+        "executable": False, "command": "", "rule_triggered": 11, "response_text": "",
+        "explanation": "I need to re-list and filter for directories.",
+        "suggested_command": "cd /proj && ls -1 | while IFS= read -r f; do [ -d \"$f\" ] && echo \"$f\"; done",
+    }))
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(gen),
+        MockResponse(MockMessage(content="DECISION: NO")),   # safety filter: read-only
+    ]
+    mock_execute_bash.return_value = "subdir1\nsubdir2"
+
+    agent = BashToolAgent()
+    assert agent.tool_calling is False
+    agent.run_single("of the files I listed, which are directories?")
+
+    # The suggested re-run was actually EXECUTED (not left as a mere suggestion).
+    mock_execute_bash.assert_called_once_with(
+        "cd /proj && ls -1 | while IFS= read -r f; do [ -d \"$f\" ] && echo \"$f\"; done")
+
+
+def test_rule11_forbids_suggesting_instead_of_running():
+    from fixtures import DOIT_SYSTEM_PROMPT
+    assert "EXECUTE, DO NOT SUGGEST" in DOIT_SYSTEM_PROMPT
 
 
 def test_doit_system_prompt_augmented_rules():
@@ -1915,6 +1994,40 @@ def test_activity_block_tags_user_and_doit():
     assert block.index("[doit] touch klum") < block.index("[user] rm klum")
 
 
+@patch("llm_communicator.llm_bash.load_config")
+def test_sync_user_history_stores_cwd(mock_load_config, monkeypatch, tmp_path):
+    """A user command imported from the exit-status log carries the directory it ran in."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    agent = BashToolAgent()
+
+    cmdlog = tmp_path / "cmdlog.tsv"
+    cmdlog.write_text("0\t/home/alice/proj\tls -la\n")   # <status>\t<dir>\t<command>
+    monkeypatch.setenv("DOIT_CMD_LOG", str(cmdlog))
+    agent._sync_user_history()
+
+    turn = history_manager.get_full_turns([1])[0]
+    assert turn["source"] == "user"
+    assert turn["command"] == "ls -la"
+    assert turn["cwd"] == "/home/alice/proj"
+
+
+def test_activity_block_shows_user_cwd_when_different():
+    """A [user] line shows '(in <dir>)' when its directory differs from the current one, and omits
+    it when the command ran in the current directory."""
+    import os
+    from llm_communicator import history_manager
+    here = os.getcwd()
+    history_manager.append_history_turn("", "ls -la", "", source="user", hist_n=1, cwd="/somewhere/else")
+    history_manager.append_history_turn("", "pwd", "", source="user", hist_n=2, cwd=here)
+
+    agent = BashToolAgent(api_key="fake-key")
+    block = agent._build_activity_block()
+    assert "[user] ls -la (in /somewhere/else)" in block   # ran elsewhere -> dir shown
+    assert "[user] pwd\n" in block or block.rstrip().endswith("[user] pwd")  # same dir -> no "(in ...)"
+    assert "[user] pwd (in" not in block
+
+
 @patch("llm_communicator.llm_bash.litellm.completion")
 @patch("llm_communicator.llm_bash.execute_bash")
 def test_user_turn_is_linked_and_replayed(mock_execute_bash, mock_completion):
@@ -1944,6 +2057,87 @@ def test_user_turn_is_linked_and_replayed(mock_execute_bash, mock_completion):
                for m in agent.conversation_history)
     # ...and the agent deleted that exact file.
     mock_execute_bash.assert_called_once_with("rm klum")
+
+
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_user_turn_replay_note_includes_cwd(mock_execute_bash, mock_completion):
+    """When a user turn has a recorded cwd, the replayed note says where it ran, so the agent can
+    target that directory. A follow-up re-runs it there (cd <dir> && ...)."""
+    from llm_communicator import history_manager
+    history_manager.append_history_turn(
+        "", "ls -la", "[Ran by the user directly in the terminal; completed successfully (exit 0). Output not captured by doit.]",
+        source="user", hist_n=1, cwd="/home/alice/proj",
+    )
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    tool_call = MockToolCall("d1", "execute_bash_command",
+                             {"command": "cd /home/alice/proj && ls -la | wc -l", "explanation": "count"})
+    msg_filter = MockMessage(content="DECISION: NO")
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(MockMessage(tool_calls=[tool_call])),
+        MockResponse(msg_filter),
+    ]
+    mock_execute_bash.return_value = "42"
+
+    agent = BashToolAgent(api_key="fake-key")
+    agent.tool_calling = True
+    agent.run_single("how many files were in that ls I ran?")
+
+    # The replayed note names the directory the user command ran in.
+    assert any("[I ran this command directly in the terminal in /home/alice/proj]: ls -la"
+               in (m.get("content") or "") for m in agent.conversation_history)
+
+
+@patch("llm_communicator.llm_bash.load_config")
+@patch("llm_communicator.llm_bash.litellm.completion")
+@patch("llm_communicator.llm_bash.execute_bash")
+def test_user_turn_replay_note_includes_cwd_fallback(mock_execute_bash, mock_completion, mock_load_config):
+    """The directory hint also reaches the model in NON-tool-calling (fallback JSON) mode, and the
+    fallback command re-runs the user command in that directory."""
+    from llm_communicator import history_manager
+    mock_load_config.return_value = ("ollama/gemma3:4b", None, False)
+    history_manager.append_history_turn(
+        "", "ls -la", "[Ran by the user directly in the terminal; completed successfully (exit 0). Output not captured by doit.]",
+        source="user", hist_n=1, cwd="/home/alice/proj",
+    )
+
+    msg_analyze = MockMessage(content='{"relevant_ids": [1]}')
+    gen_json = json.dumps({"executable": True, "command": "cd /home/alice/proj && ls -la | wc -l",
+                           "explanation": "count files", "rule_triggered": 11, "response_text": ""})
+    mock_completion.side_effect = [
+        MockResponse(msg_analyze),
+        MockResponse(MockMessage(content=gen_json)),
+        MockResponse(MockMessage(content="DECISION: NO")),
+    ]
+    mock_execute_bash.return_value = "42"
+
+    agent = BashToolAgent()
+    assert agent.tool_calling is False
+    agent.run_single("how many files were in that ls I ran?")
+
+    # The folded user_content carries the directory the command ran in...
+    assert any("[I ran this command directly in the terminal in /home/alice/proj]: ls -la"
+               in (m.get("content") or "") for m in agent.conversation_history)
+    # ...and the fallback command re-ran it in that directory.
+    mock_execute_bash.assert_called_once_with("cd /home/alice/proj && ls -la | wc -l")
+
+
+def test_user_turn_replay_note_omits_cwd_when_absent():
+    """A legacy user turn without a cwd replays the plain note (no 'in <dir>')."""
+    from llm_communicator import history_manager
+    turn = {"id": 1, "source": "user", "cwd": None, "command": "ls", "output": "", "prompt": ""}
+    where = f" in {turn['cwd']}" if turn.get("cwd") else ""
+    note = f"[I ran this command directly in the terminal{where}]: {turn.get('command', '')}"
+    assert note == "[I ran this command directly in the terminal]: ls"
+
+
+def test_rule11_mentions_running_in_recorded_directory():
+    """Rule 11 tells the model to re-run a user command in the directory it originally ran in."""
+    from fixtures import DOIT_SYSTEM_PROMPT
+    assert "DIRECTORY IT ORIGINALLY RAN IN" in DOIT_SYSTEM_PROMPT
+    assert "cd <dir> && <their command>" in DOIT_SYSTEM_PROMPT
 
 
 @patch("llm_communicator.llm_bash.litellm.completion")
@@ -2144,9 +2338,28 @@ def test_user_turn_replay_includes_ran_marker(mock_execute_bash, mock_completion
 
 def test_parse_cmd_log():
     from llm_communicator.tools import parse_cmd_log
-    raw = "0\ttouch klum\n1\tfalse\n2\tls /nope\n"
-    assert parse_cmd_log(raw) == [(1, "0", "touch klum"), (2, "1", "false"), (3, "2", "ls /nope")]
+    # Current 3-column format: "<status>\t<dir>\t<command>" -> (index, status, cwd, command).
+    raw = "0\t/home/me\ttouch klum\n1\t/tmp\tfalse\n2\t/var/log\tls /nope\n"
+    assert parse_cmd_log(raw) == [
+        (1, "0", "/home/me", "touch klum"),
+        (2, "1", "/tmp", "false"),
+        (3, "2", "/var/log", "ls /nope"),
+    ]
     assert parse_cmd_log("") == []
+
+
+def test_parse_cmd_log_legacy_two_column():
+    # Legacy 2-column lines ("<status>\t<command>", no directory) still parse, with cwd=None.
+    from llm_communicator.tools import parse_cmd_log
+    raw = "0\ttouch klum\n1\tfalse\n"
+    assert parse_cmd_log(raw) == [(1, "0", None, "touch klum"), (2, "1", None, "false")]
+
+
+def test_parse_cmd_log_mixed_columns():
+    # A file mixing legacy 2-column and new 3-column lines (e.g. an existing session upgraded mid-use).
+    from llm_communicator.tools import parse_cmd_log
+    raw = "0\tls\n0\t/tmp\tls -la\n"
+    assert parse_cmd_log(raw) == [(1, "0", None, "ls"), (2, "0", "/tmp", "ls -la")]
 
 
 @patch("llm_communicator.llm_bash.load_config")
@@ -2166,7 +2379,8 @@ def test_sync_uses_exit_status_log_success_and_failure(mock_load_config, monkeyp
     assert turns[0]["command"] == "touch klum"
     assert "completed successfully (exit 0)" in turns[0]["output"]
     assert turns[1]["command"] == "cat /nonexistent"
-    assert "FAILED (exit 2)" in turns[1]["output"]
+    # Records the failure with the exit code (now also interpreted: "exit 2: <meaning>").
+    assert "FAILED (exit 2" in turns[1]["output"]
 
 
 @patch("llm_communicator.llm_bash.load_config")

@@ -70,7 +70,7 @@ def _read_turns(path: Path) -> List[Dict[str, Any]]:
         return []
     return turns
 
-def append_history_turn(prompt: str, command: str, output: str, relevant_ids: List[int] = None, suggested_command: str = "", source: str = "doit", hist_n: int = None) -> None:
+def append_history_turn(prompt: str, command: str, output: str, relevant_ids: List[int] = None, suggested_command: str = "", source: str = "doit", hist_n: int = None, cwd: str = None) -> None:
     """
     Appends a new conversation/execution turn to the session history.
 
@@ -79,7 +79,8 @@ def append_history_turn(prompt: str, command: str, output: str, relevant_ids: Li
 
     `source` is "doit" for the agent's own turns, or "user" for a command the user ran DIRECTLY in
     the terminal (synced from shell history). `hist_n` is the shell-history index of a user command
-    (the de-dup high-water mark); it is None for doit turns.
+    (the de-dup high-water mark); it is None for doit turns. `cwd` is the directory a user command
+    ran in (from the shell recorder), so doit can re-run it there later; None when unknown.
     """
     path = get_history_file_path()
 
@@ -99,6 +100,7 @@ def append_history_turn(prompt: str, command: str, output: str, relevant_ids: Li
         "id": next_id,
         "source": source,
         "hist_n": hist_n,
+        "cwd": cwd,
         "prompt": prompt,
         "command": command,
         "suggested_command": suggested_command,
@@ -145,6 +147,7 @@ def get_history_metadata(limit: int = 10, session_dir: Optional[Path] = None) ->
             metadata.append({
                 "id": turn["id"],
                 "source": turn.get("source", "doit"),
+                "cwd": turn.get("cwd"),
                 "prompt": turn["prompt"],
                 "command": turn["command"],
                 "suggested_command": turn.get("suggested_command", "")

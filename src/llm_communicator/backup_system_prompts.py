@@ -135,6 +135,10 @@ FEWSHOT_TOOLCALL = [
     {"role": "assistant", "tool_calls": [{"id": "fs_exec_1", "type": "function",
         "function": {"name": "execute_bash_command", "arguments": '{"command": "touch notes.txt", "explanation": "create an empty file notes.txt"}'}}]},
     {"role": "tool", "tool_call_id": "fs_exec_1", "name": "execute_bash_command", "content": "[Success]"},
+    # NOTE: do NOT add general-knowledge/trivia questions as few-shot examples here. The weak model
+    # treats the example's USER line as a real question and ANSWERS it (observed: it answered a
+    # "height of a giraffe" example verbatim), which is worse than the leak we were trying to fix.
+    # General-knowledge rejection (Rule 4) is enforced by the system prompt override instead.
     # USER asked for SEVERAL distinct actions -> call execute_plan (one command per step). The plan is
     # shown before running and stops on the first failure. (Rule 13.)
     {"role": "user", "content": "set up a python project: create a folder, add a main.py, and initialize git"},
