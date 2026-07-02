@@ -60,7 +60,7 @@ DoitToolUseAgent[@T]: {
         } Else {
             If(sys.pid.turn[@t].suggested_command != "") {
                 A: sys.pid.answer_call[@t]      // NEW: answer_question call (explanation = stored output, suggested_command)
-                T: sys.pid.turn[@t].output      // fixed tool result: suggestion delivered, NOT executed
+                T: sys.answer_delivered_notice     // fixed tool result: suggestion delivered, NOT executed
             } Else {
                 A: sys.pid.turn[@t].output      // turn produced neither: plain assistant message
             }
